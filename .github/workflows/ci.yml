@@ -1,0 +1,78 @@
+# Checks every pull request and every push to main. The job names are the required checks in the main branch rules
+# (.github/scripts/setup-repo.sh), so keep them in sync when renaming.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: tool
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tool/go.mod
+      - run: go build ./...
+      - run: go test -count=1 ./...
+
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tool/go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l tool)
+          if [ -n "$unformatted" ]; then echo "::error::not formatted with gofmt: $unformatted"; exit 1; fi
+      - name: go mod tidy
+        working-directory: tool
+        run: go mod tidy -diff
+      - name: go vet
+        working-directory: tool
+        run: go vet ./...
+      - name: staticcheck
+        working-directory: tool
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 ./...
+      - name: govulncheck (known vulnerabilities in Go and dependencies)
+        working-directory: tool
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: race detector
+        working-directory: tool
+        run: go test -race -count=1 ./...
+      - name: shellcheck
+        run: shellcheck -S warning hosting/test/run.sh .github/scripts/*.sh
+      - name: Python syntax
+        run: python3 -m py_compile proto/*.py hosting/test/*.py
+      - name: actionlint (workflow files)
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@latest
+
+  commits:
+    name: commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Conventional Commits, no merge commits
+        run: .github/scripts/check-commits.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"

@@ -1,0 +1,35 @@
+name: Format change proposal
+description: A change or addition to the karaoke feed format (SPEC.md)
+labels: [spec]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The format has to stay implementable in a weekend in Pascal, C#, C++ or JavaScript with JSON, HTTP and
+        SHA-256. Please read DESIGN.md first: many alternatives are already discussed there.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't be done today, for whom? A real case helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: New or changed fields and rules, ideally with a JSON example.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility
+      description: What happens with existing feeds, and with clients that don't know the change?
+    validations:
+      required: true
+  - type: textarea
+    id: implementers
+    attributes:
+      label: Effort for implementers
+      description: What would a game or tool have to do to support it?

@@ -1,0 +1,21 @@
+name: Feature request
+description: An idea for kfeed, the guides or the configurations
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would it solve?
+      description: Who needs it (player, feed operator, server admin, game developer) and in which situation?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

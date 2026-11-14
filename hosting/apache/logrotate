@@ -1,0 +1,15 @@
+# Error log of the karaoke feed on Apache: rotated daily, kept for 14 days.
+# Copy to /etc/logrotate.d/karaoke-feed.
+# Debian/Ubuntu: change the path to /var/log/apache2/feed/error.log.
+# The log is in its own folder because the distribution's own logrotate file already handles /var/log/httpd/*log.
+# copytruncate: Apache keeps writing to the same file, so no reload is needed after rotation.
+/var/log/httpd/feed/error.log {
+    daily
+    rotate 14
+    maxage 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}

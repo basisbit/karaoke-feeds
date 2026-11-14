@@ -1,0 +1,137 @@
+# Karaoke feed on Caddy 2. Before use, replace:
+#   feed.example.org   your host name (Caddy gets the certificate by itself and redirects http to https)
+#   /var/www/feed      the folder the feed is uploaded into
+# Logging: no access log (Caddy writes none unless a site has a "log" directive, so don't add one).
+#   Warnings and errors go to /var/log/caddy/error.log; Caddy rotates it daily itself and deletes files after 14 days.
+#   The folder must be writable by the user Caddy runs as (Fedora/Debian package: caddy).
+# Reasons for every limit: docs/hosting.md, section "Security and rate limits".
+# Many downloads at once need no settings: Caddy handles each connection in its own lightweight thread, and the
+#   Fedora/Debian package already allows 1048576 open files (LimitNOFILE in caddy.service).
+#
+# Caddy has NO per-client rate limiting of its own. Options, from simple to involved:
+#   1. a CDN in front (recommended for public feeds anyway), or
+#   2. a Caddy build with the third-party plugin github.com/mholt/caddy-ratelimit
+#      ("xcaddy build --with github.com/mholt/caddy-ratelimit"), then uncomment the two marked parts below.
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 10s
+			idle 30s
+		}
+		max_header_size 16KB
+	}
+	log {
+		output file /var/log/caddy/error.log {
+			roll_interval 24h
+			roll_keep 14
+			roll_keep_for 14d
+		}
+		level WARN
+	}
+	# PLUGIN ONLY: order rate_limit before basic_auth
+}
+
+(feed_headers) {
+	header {
+		-Server
+		Access-Control-Allow-Origin *
+		X-Content-Type-Options nosniff
+		Cross-Origin-Resource-Policy cross-origin
+		Referrer-Policy no-referrer
+		Strict-Transport-Security "max-age=31536000"
+	}
+}
+
+feed.example.org {
+	root * /var/www/feed
+
+	# Headers on every response; repeated in handle_errors because Caddy starts error responses fresh.
+	# No "encode": files must arrive byte for byte.
+	import feed_headers
+
+	@badmethod not method GET HEAD
+	@query expression `{http.request.orig_uri}.contains("?")`
+	@feed path /feed.json
+	@page path_regexp ^/(index\.(html|css|js)|songs-[a-z0-9][a-z0-9._-]{0,63}\.html)?$
+	@not_page not path_regexp ^/(index\.(html|css|js)|songs-[a-z0-9][a-z0-9._-]{0,63}\.html)?$
+
+	# Behind a CDN (docs/hosting.md section 5.1): remove the "# " from this line and from "error @not_from_cdn 403"
+	# below, with your own secret. Requests without it then get 403, so nobody can bypass the CDN.
+	# @not_from_cdn not header X-Feed-Origin-Auth "change-me-to-a-long-random-secret"
+	@immutable path_regexp ^/(sig/[0-9a-f]{64}\.sig|catalog/[0-9a-f]{64}\.json(\.gz)?|blobs/[0-9a-f]{2}/[0-9a-f]{64})$
+
+	# Private feed (docs/hosting.md section 9): personal addresses https://feed.example.org/s/<token>/feed.json
+	# Remove the "# " from the lines between "private feed: begin" and "end", here and in the route below.
+	# Then only addresses with a token from /etc/caddy/feed-tokens work. That file has one line per token:
+	#   the-token 1
+	# After changing it: caddy reload (downloads that are running continue).
+	# --- private feed: begin
+	# map {http.request.orig_uri.path} {feed_token} {
+	# 	~^/s/([A-Za-z0-9_-]{22,128})/ "${1}"
+	# 	default ""
+	# }
+	# map {feed_token} {feed_token_ok} {
+	# 	import /etc/caddy/feed-tokens
+	# 	default 0
+	# }
+	# @personal path_regexp personal ^/s/[A-Za-z0-9_-]{22,128}(/.*)$
+	# @personal_blob path_regexp personal_blob ^/s/[A-Za-z0-9_-]{22,128}(/blobs/[0-9a-f]{2}/[0-9a-f]{64})$
+	# @no_token not vars {feed_token_ok} 1
+	# --- private feed: end
+
+	route {
+		# PLUGIN ONLY: 200 requests per 10 s per client IP (about 20/s with bursts).
+		# rate_limit {
+		# 	zone per_ip {
+		# 		key {remote_host}
+		# 		events 200
+		# 		window 10s
+		# 	}
+		# }
+
+		# error @not_from_cdn 403
+
+		# Only reading, and no query strings: games never send them, and "?random" would bypass every cache.
+		error @badmethod 405
+		error @query 400
+
+		# Private feed: without a valid token 403; with one, /s/<token>/feed.json is served as /feed.json, and
+		# shared caches must not keep the answer.
+		# --- private feed: begin
+		# error @no_token 403
+		# header @personal >Cache-Control public private
+		# --- private feed: end
+		# Optional, for a private feed: let a CDN or a file store deliver the big files. Remove the "# " and put
+		# in its address; it must serve the folder blobs/. Whoever knows a file's checksum can then fetch it there.
+		# redir @personal_blob https://cdn.example.org{re.personal_blob.1} 302
+		# --- private feed: begin
+		# rewrite @personal {re.personal.1}
+		# --- private feed: end
+
+		# Content-Security-Policy: the landing page may load its own stylesheet and script, everything else
+		# nothing. (Not in feed_headers: Caddy postpones a header block that deletes a header, which would
+		# overwrite this.)
+		header @page Content-Security-Policy "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		header @not_page Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+
+		# Only the feed's own files; everything else is 404.
+		header @feed >Cache-Control "public, max-age=300, stale-if-error=86400"
+		header @immutable >Cache-Control "public, max-age=31536000, immutable"
+		header @immutable Content-Type application/octet-stream
+		# The landing page made by kfeed build.
+		header @page >Cache-Control "public, max-age=300"
+		encode @page gzip
+		file_server @page
+		file_server @feed
+		file_server @immutable
+		error 404
+	}
+
+	handle_errors {
+		import feed_headers
+		header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		header -Cache-Control
+		respond "{err.status_code}" {err.status_code}
+	}
+}

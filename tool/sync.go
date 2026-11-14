@@ -1,0 +1,910 @@
+package main
+
+// kfeed sync: the player side. Keeps a library folder in step with a feed (SPEC section 5).
+
+import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+)
+
+const (
+	stateDirName = ".kfeed"
+	hiddenSuffix = ".kfeed-hidden" // a txt renamed like this is ignored by the games (they look for *.txt)
+	partPrefix   = ".kfeed-part-"
+)
+
+var errChooseCatalogs = errors.New("choose what to sync")
+
+type fileRec struct {
+	SHA256 string `json:"sha256"` // hex
+	Size   int64  `json:"size"`
+	MTime  int64  `json:"mtime"` // of the file when it was last hashed; a cheap "unchanged" check
+}
+
+type songRec struct {
+	Catalog string             `json:"catalog"`
+	Txt     string             `json:"txt"`
+	Hidden  bool               `json:"hidden,omitempty"`
+	Files   map[string]fileRec `json:"files"`
+}
+
+type syncState struct {
+	Locations         []string            `json:"locations"`
+	Trust             []string            `json:"trust"`
+	Sequence          int64               `json:"sequence"`
+	FeedSHA           string              `json:"feed_sha256"`
+	Catalogs          []string            `json:"catalogs"` // nil: not chosen yet; ["*"]: all, also future ones
+	IncludeUndeclared bool                `json:"include_undeclared"`
+	Exclude           []string            `json:"exclude,omitempty"` // license properties the player doesn't want: nc, nd, sa
+	Songs             map[string]*songRec `json:"songs"`
+}
+
+type syncOpts struct {
+	feed              string   // address given on the command line ("" = use the stored one)
+	lib               string   // library folder
+	catalogs          []string // nil = keep the stored choice
+	all               bool
+	includeUndeclared *bool
+	exclude           *[]string
+	key               string
+	replaceLocal      bool
+	jobs              int
+}
+
+type syncReport struct {
+	mu                                                   sync.Mutex
+	feedNote                                             string
+	added, updated, unchanged, hidden, unhidden, removed []string
+	withdrawn, moved, keptLocal, unsafe, undeclared      []string
+	excluded                                             []string
+	failed                                               []string
+	downloaded                                           int64
+	retried                                              int
+}
+
+func (r *syncReport) add(list *[]string, s string) {
+	r.mu.Lock()
+	*list = append(*list, s)
+	r.mu.Unlock()
+}
+
+type catalogsFlag []string
+
+func (c *catalogsFlag) String() string     { return strings.Join(*c, ",") }
+func (c *catalogsFlag) Set(v string) error { *c = append(*c, v); return nil }
+
+func cmdSync(args []string) error {
+	fl := flag.NewFlagSet("sync", flag.ContinueOnError)
+	var cats catalogsFlag
+	fl.Var(&cats, "catalog", "catalog id to sync (repeatable; replaces the stored choice)")
+	all := fl.Bool("all", false, "sync all catalogs, also ones added later")
+	undeclared := fl.Bool("include-undeclared", false, "also sync songs without a declared license")
+	exclude := fl.String("exclude", "", "leave out songs with these license properties: nc, nd, sa (comma-separated; \"\" for none)")
+	key := fl.String("key", "", "the feed's public key (ed25519:...) or a file containing it, if not in the address")
+	replace := fl.Bool("replace-local", false, "replace locally changed files with the feed's version")
+	jobs := fl.Int("jobs", 4, "parallel downloads")
+	pos, err := parse(fl, args)
+	if err != nil || len(pos) < 1 || len(pos) > 2 || *jobs < 1 || *jobs > 32 {
+		return errors.New("usage: kfeed sync [<feed address> | -] <library folder> [--catalog id]... [--all] [--include-undeclared] [--key ed25519:...] [--replace-local] [--jobs 4]")
+	}
+	o := syncOpts{lib: pos[len(pos)-1], key: *key, all: *all, replaceLocal: *replace, jobs: *jobs}
+	if len(pos) == 2 {
+		o.feed = pos[0]
+	}
+	if o.feed == "-" {
+		if o.feed, err = readAddress(); err != nil {
+			return err
+		}
+	}
+	if len(cats) > 0 {
+		o.catalogs = cats
+	}
+	fl.Visit(func(f *flag.Flag) {
+		if f.Name == "include-undeclared" {
+			o.includeUndeclared = undeclared
+		}
+		if f.Name == "exclude" {
+			list := []string{}
+			for _, p := range strings.Split(strings.ToLower(*exclude), ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					list = append(list, p)
+				}
+			}
+			o.exclude = &list
+		}
+	})
+	rep, err := syncLibrary(o, os.Stdout)
+	if rep != nil {
+		printReport(os.Stdout, rep)
+		if err == nil && len(rep.failed) > 0 {
+			err = fmt.Errorf("%d problems, see above; run again later to retry", len(rep.failed))
+		}
+	}
+	return err
+}
+
+// readAddress reads the feed address from standard input, so that a personal address (SPEC 5.5) does not end up in
+// the shell history.
+func readAddress() (string, error) {
+	if f, ok := stdin.(*os.File); ok {
+		if fi, err := f.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+			fmt.Fprint(os.Stderr, "Feed address: ")
+		}
+	}
+	line, err := bufio.NewReader(io.LimitReader(stdin, 4096)).ReadString('\n')
+	if line = strings.TrimSpace(line); line == "" {
+		if err == nil || err == io.EOF {
+			err = errors.New("empty")
+		}
+		return "", fmt.Errorf("no feed address on standard input: %v", err)
+	}
+	return line, nil
+}
+
+// accessNote explains the answers a server gives when it refuses a personal address (SPEC 5.5).
+func accessNote(err error) string {
+	if s := err.Error(); s == "HTTP 401" || s == "HTTP 403" {
+		return s + ", access refused (if this is a private feed: your access may have ended, or your address was replaced)"
+	}
+	return err.Error()
+}
+
+func loadState(dir string) (*syncState, error) {
+	st := &syncState{Songs: map[string]*songRec{}}
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return st, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, st); err != nil {
+		return nil, fmt.Errorf("%s/state.json is damaged: %v", dir, err)
+	}
+	if st.Songs == nil {
+		st.Songs = map[string]*songRec{}
+	}
+	return st, nil
+}
+
+func writeAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
+	sdir := filepath.Join(o.lib, stateDirName)
+	// The state is private: it holds the feed address, which can contain an access token (SPEC 5.5).
+	if err := os.MkdirAll(filepath.Join(sdir, "catalogs"), 0o700); err != nil {
+		return nil, err
+	}
+	os.Chmod(sdir, 0o700) // also for libraries made by older versions
+	lock := filepath.Join(sdir, "lock")
+	lf, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("another sync of %s is running (or one crashed: then delete %s)", o.lib, lock)
+	}
+	fmt.Fprintf(lf, "%d\n", os.Getpid())
+	lf.Close()
+	defer os.Remove(lock)
+
+	st, err := loadState(sdir)
+	if err != nil {
+		return nil, err
+	}
+	rep := &syncReport{}
+
+	// 1. where the feed is, and which keys it must be signed with
+	given, fragKey, _ := strings.Cut(o.feed, "#ed25519=")
+	if fragKey != "" && o.key == "" {
+		o.key = "ed25519:" + fragKey
+	}
+	if o.key != "" {
+		var err error
+		if o.key, err = publicKeyArg(o.key); err != nil {
+			return nil, err
+		}
+		if len(st.Trust) > 0 && !slices.Contains(st.Trust, o.key) {
+			return nil, fmt.Errorf("the key %s is not one of this subscription's keys %v", o.key, st.Trust)
+		}
+		if len(st.Trust) == 0 && st.Sequence > 0 {
+			return nil, errors.New("this library was subscribed to an unsigned feed; to add a key, subscribe again in a new folder")
+		}
+		if len(st.Trust) == 0 {
+			st.Trust = []string{o.key}
+		}
+	}
+	given = strings.TrimSuffix(given, "feed.json")
+	if given == "" && len(st.Locations) == 0 {
+		return nil, errors.New("the first sync of a library needs the feed address")
+	}
+	newLocation := given != "" && !slices.Contains(st.Locations, given)
+	if newLocation && len(st.Locations) > 0 && len(st.Trust) == 0 {
+		return nil, fmt.Errorf("this feed is unsigned, so it can only be synced from %s (SPEC 6.3)", showLoc(st.Locations[0]))
+	}
+
+	// 2. feed.json
+	feed, _, signed, err := acceptFeed(st, given, newLocation, sdir, rep)
+	if err != nil {
+		return nil, err
+	}
+	locs := []source{}
+	for _, l := range append(slices.Clone(st.Locations), feed.Mirrors...) {
+		locs = append(locs, newSource(l))
+	}
+
+	// 3. which catalogs
+	ids := []string{}
+	for _, c := range feed.Catalogs {
+		ids = append(ids, c.ID)
+	}
+	switch {
+	case o.all:
+		st.Catalogs = []string{"*"}
+	case o.catalogs != nil:
+		for _, c := range o.catalogs {
+			if !slices.Contains(ids, c) {
+				return nil, fmt.Errorf("the feed has no catalog %q (it has: %s)", c, strings.Join(ids, ", "))
+			}
+		}
+		st.Catalogs = o.catalogs
+	}
+	if o.includeUndeclared != nil {
+		st.IncludeUndeclared = *o.includeUndeclared
+	}
+	if o.exclude != nil {
+		for _, p := range *o.exclude {
+			if p != "nc" && p != "nd" && p != "sa" {
+				return nil, fmt.Errorf("--exclude knows nc (NonCommercial), nd (NoDerivatives) and sa (ShareAlike), not %q", p)
+			}
+		}
+		st.Exclude = *o.exclude
+	}
+	if st.Catalogs == nil {
+		fmt.Fprintf(w, "Feed %q (%s) has these catalogs:\n", feed.Name, feed.Operator.Name)
+		for _, c := range feed.Catalogs {
+			fmt.Fprintf(w, "  %-24s %-30s %5d songs %9.1f MB\n", c.ID, c.Names["en"], c.Songs, float64(c.Bytes)/1e6)
+		}
+		fmt.Fprintln(w, "Choose with --catalog <id> (repeatable) or --all, then run again.")
+		return nil, errChooseCatalogs
+	}
+	selected := func(id string) bool { return slices.Contains(st.Catalogs, "*") || slices.Contains(st.Catalogs, id) }
+
+	// 4. catalogs: from the local cache or downloaded, always verified
+	wanted := map[string]Song{}
+	songCat := map[string]string{}
+	filtered := map[string]bool{} // in a selected catalog, but not synced (unsafe, or the player's license choice)
+	byChoice := map[string]bool{} // not synced because of the player's license choice
+	failedCats := map[string]bool{}
+	moved := map[string]string{}
+	keepCache := map[string]bool{}
+	for _, ref := range feed.Catalogs {
+		if !selected(ref.ID) {
+			continue
+		}
+		name := filepath.Base(ref.Path)
+		keepCache[name] = true
+		cat, err := loadCatalog(locs, ref, filepath.Join(sdir, "catalogs", name))
+		if err != nil {
+			failedCats[ref.ID] = true
+			rep.add(&rep.failed, fmt.Sprintf("catalog %s: %v", ref.ID, err))
+			continue
+		}
+		for old, nu := range cat.Moved {
+			moved[old] = nu
+		}
+		for _, s := range cat.Songs {
+			if _, dup := wanted[s.ID]; dup || filtered[s.ID] {
+				continue // first catalog wins (SPEC 3)
+			}
+			if p := songProblem(s); p != "" {
+				filtered[s.ID] = true
+				rep.add(&rep.unsafe, fmt.Sprintf("%s: %s", s.ID, p))
+				continue
+			}
+			if !st.IncludeUndeclared && undeclared(s) {
+				filtered[s.ID], byChoice[s.ID] = true, true
+				rep.add(&rep.undeclared, s.ID)
+				continue
+			}
+			if p := licenseExcluded(s, st.Exclude); p != "" {
+				filtered[s.ID], byChoice[s.ID] = true, true
+				rep.add(&rep.excluded, s.ID+" ("+p+")")
+				continue
+			}
+			wanted[s.ID], songCat[s.ID] = s, ref.ID
+		}
+	}
+	if entries, err := os.ReadDir(filepath.Join(sdir, "catalogs")); err == nil {
+		for _, e := range entries {
+			if !keepCache[e.Name()] {
+				os.Remove(filepath.Join(sdir, "catalogs", e.Name()))
+			}
+		}
+	}
+
+	// 5. renames, withdrawals, songs that are no longer offered
+	for old, nu := range moved {
+		rec, ok := st.Songs[old]
+		if !ok || st.Songs[nu] != nil || !idRe.MatchString(nu) || !idRe.MatchString(old) {
+			continue
+		}
+		if err := os.Rename(filepath.Join(o.lib, old), filepath.Join(o.lib, nu)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			rep.add(&rep.failed, fmt.Sprintf("%s: rename to %s: %v", old, nu, err))
+			continue
+		}
+		st.Songs[nu] = rec
+		delete(st.Songs, old)
+		rep.add(&rep.moved, old+" → "+nu)
+	}
+	for id, rec := range st.Songs {
+		if _, ok := wanted[id]; ok || failedCats[rec.Catalog] {
+			continue
+		}
+		folder := filepath.Join(o.lib, id)
+		switch {
+		case signed && slices.Contains(feed.Removed, id):
+			removeSong(folder, rec, rep)
+			delete(st.Songs, id)
+			rep.add(&rep.withdrawn, id)
+		case !selected(rec.Catalog) || byChoice[id]:
+			removeSong(folder, rec, rep)
+			delete(st.Songs, id)
+			rep.add(&rep.removed, id)
+		case !rec.Hidden:
+			if err := hideTxt(folder, rec.Txt); err != nil {
+				rep.add(&rep.failed, fmt.Sprintf("%s: hide: %v", id, err))
+				continue
+			}
+			rec.Hidden = true
+			rep.add(&rep.hidden, id)
+		}
+	}
+
+	// 6. bring every wanted song up to date
+	known := map[string]string{} // blob hex -> a verified local file with it
+	for id, rec := range st.Songs {
+		for name, f := range rec.Files {
+			known[f.SHA256] = filepath.Join(o.lib, id, name)
+		}
+	}
+	plans := []*songPlan{}
+	sortedIDs := make([]string, 0, len(wanted))
+	for id := range wanted {
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Strings(sortedIDs)
+	for _, id := range sortedIDs {
+		if p := planSong(o, st, id, wanted[id], songCat[id], rep); p != nil {
+			plans = append(plans, p)
+		}
+	}
+	runDownloads(o, locs, plans, known, rep, false) // media first
+	runDownloads(o, locs, plans, known, rep, true)  // then the txt, so a song only appears when it is complete
+	for _, p := range plans {
+		finishSong(o, st, p, rep)
+	}
+
+	// 7. save
+	data, _ := json.MarshalIndent(st, "", " ")
+	if err := writeAtomic(filepath.Join(sdir, "state.json"), data); err != nil {
+		return rep, err
+	}
+	return rep, nil
+}
+
+// acceptFeed applies SPEC 5.1 and 6. It returns the feed.json to use: a newly accepted one or the cached one.
+func acceptFeed(st *syncState, given string, newLocation bool, sdir string, rep *syncReport) (*Feed, []byte, bool, error) {
+	cached := filepath.Join(sdir, "feed.json")
+	try := slices.Clone(st.Locations)
+	if given != "" {
+		try = append([]string{given}, slices.DeleteFunc(try, func(l string) bool { return l == given })...)
+	}
+	var notes []string
+	for hop := 0; hop < 2; hop++ { // the second round follows moved_to once
+		for _, loc := range try {
+			raw, _, err := newSource(loc).get("feed.json", maxFeedSize)
+			if err != nil {
+				notes = append(notes, fmt.Sprintf("%s: %v", showLoc(loc), accessNote(err)))
+				continue
+			}
+			var f Feed
+			if err := json.Unmarshal(raw, &f); err != nil || f.Spec != Spec {
+				notes = append(notes, fmt.Sprintf("%s: not a %s feed", showLoc(loc), Spec))
+				continue
+			}
+			trust, tofu := st.Trust, len(st.Trust) == 0 && st.Sequence == 0
+			if tofu && len(f.Keys) > 0 {
+				trust = f.Keys // trust on first use
+			}
+			if len(trust) > 0 {
+				sig, _, err := newSource(loc).get("sig/"+hashBytes(raw)+".sig", 1024)
+				if err != nil || len(f.Keys) == 0 || len(f.Keys) > 8 || !sigValid(trust, raw, string(sig)) {
+					notes = append(notes, fmt.Sprintf("%s: signature missing or not valid for this subscription's keys", showLoc(loc)))
+					continue
+				}
+			}
+			if loc == given && newLocation && !slices.Contains(st.Locations, loc) {
+				st.Locations = append([]string{loc}, st.Locations...) // verified: a new place for this feed (LAN, USB)
+			}
+			if st.Sequence > 0 && (f.Sequence < st.Sequence || (f.Sequence == st.Sequence && hashBytes(raw) != st.FeedSHA)) {
+				notes = append(notes, fmt.Sprintf("%s: older than the feed this library already has; its files are still used", showLoc(loc)))
+				continue
+			}
+			if len(trust) > 0 && f.MovedTo != "" && hop == 0 {
+				if err := checkMirror(f.MovedTo); err == nil {
+					try = []string{strings.TrimSuffix(f.MovedTo, "feed.json")}
+					rep.feedNote = "the feed moved to " + try[0]
+					st.Locations = append(try, slices.DeleteFunc(st.Locations, func(l string) bool { return l == try[0] })...)
+					break
+				}
+			}
+			if len(trust) > 0 {
+				st.Trust = f.Keys
+			}
+			st.Sequence, st.FeedSHA = f.Sequence, hashBytes(raw)
+			if len(st.Locations) == 0 {
+				st.Locations = []string{loc}
+			}
+			if err := writeAtomic(cached, raw); err != nil {
+				return nil, nil, false, err
+			}
+			if rep.feedNote == "" {
+				rep.feedNote = fmt.Sprintf("feed %q, sequence %d, %s", f.Name, f.Sequence, map[bool]string{true: "signed", false: "unsigned"}[len(trust) > 0])
+			}
+			return &f, raw, len(trust) > 0, nil
+		}
+		if !strings.HasPrefix(rep.feedNote, "the feed moved") {
+			break
+		}
+	}
+	raw, err := os.ReadFile(cached)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("no usable feed.json: %s", strings.Join(notes, "; "))
+	}
+	var f Feed
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, nil, false, err
+	}
+	rep.feedNote = "using the feed from the last sync (" + strings.Join(notes, "; ") + ")"
+	return &f, raw, len(st.Trust) > 0, nil
+}
+
+func loadCatalog(locs []source, ref CatalogRef, cache string) (*Catalog, error) {
+	if !hashRe.MatchString(ref.SHA256) || ref.Size < 0 || ref.Size > maxCatalog {
+		return nil, errors.New("malformed reference in feed.json")
+	}
+	if data, err := os.ReadFile(cache); err == nil {
+		if c, err := decodeCatalog(ref, data); err == nil {
+			return c, nil
+		}
+	}
+	var last error
+	for _, s := range locs {
+		for try := 1; try <= attempts; try++ {
+			data, _, err := s.get(ref.Path, ref.Size)
+			if err != nil && len(data) == 0 {
+				last = err
+				break
+			}
+			c, err := decodeCatalog(ref, data)
+			if err != nil {
+				last = err
+				continue // incomplete or damaged: try again
+			}
+			writeAtomic(cache, data)
+			return c, nil
+		}
+	}
+	return nil, last
+}
+
+// songProblem implements the per-entry checks of SPEC 4.1 and 5.2.
+func songProblem(s Song) string {
+	if !idRe.MatchString(s.ID) {
+		return "invalid id"
+	}
+	txts, seen := 0, map[string]bool{}
+	for _, f := range s.Files {
+		if _, known := roleExt[f.Role]; !known {
+			continue // unknown roles are ignored
+		}
+		if p := nameProblem(f.Name, f.Role); p != "" {
+			return fmt.Sprintf("file name %q %s", f.Name, p)
+		}
+		if seen[strings.ToLower(f.Name)] {
+			return fmt.Sprintf("two files named %q", f.Name)
+		}
+		seen[strings.ToLower(f.Name)] = true
+		if !hashRe.MatchString(f.SHA256) || f.Size < 0 {
+			return "malformed hash or size"
+		}
+		if f.Role == "txt" {
+			txts++
+		}
+	}
+	if txts != 1 {
+		return fmt.Sprintf("%d txt files instead of 1", txts)
+	}
+	return ""
+}
+
+func undeclared(s Song) bool {
+	for _, f := range s.Files {
+		if _, known := roleExt[f.Role]; known && f.Role != "license" && (f.License == nil || f.License.SPDX == "NOLICENSE") {
+			return true
+		}
+	}
+	return false
+}
+
+// licenseExcluded returns the first license property of the song that the player excluded, or "".
+// Creative Commons SPDX ids carry them in their name: CC-BY-NC-SA-4.0 is NonCommercial and ShareAlike.
+func licenseExcluded(s Song, exclude []string) string {
+	for _, f := range s.Files {
+		if _, known := roleExt[f.Role]; !known || f.Role == "license" || f.License == nil {
+			continue
+		}
+		id := strings.ToUpper(f.License.SPDX)
+		if !strings.HasPrefix(id, "CC-") {
+			continue
+		}
+		for _, p := range exclude {
+			if strings.Contains(id, "-"+strings.ToUpper(p)+"-") {
+				return p + ": " + f.License.SPDX
+			}
+		}
+	}
+	return ""
+}
+
+// localHash returns the hash of a file in the library, using the recorded size and time to skip re-hashing.
+// A symlink or anything that is not a regular file counts as foreign ("x").
+func localHash(path string, rec fileRec, hasRec bool) (string, bool) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", false
+	}
+	if !fi.Mode().IsRegular() {
+		return "x", true
+	}
+	if hasRec && fi.Size() == rec.Size && fi.ModTime().UnixNano() == rec.MTime {
+		return rec.SHA256, true
+	}
+	sum, _, err := hashFile(path)
+	if err != nil {
+		return "x", true
+	}
+	return sum, true
+}
+
+func record(path, sum string) fileRec {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileRec{SHA256: sum}
+	}
+	return fileRec{SHA256: sum, Size: fi.Size(), MTime: fi.ModTime().UnixNano()}
+}
+
+type fileJob struct {
+	name, hex, path string
+	size            int64
+	txt             bool
+	done            bool
+}
+
+type songPlan struct {
+	id, folder, catalog string
+	song                Song
+	isNew, wasHidden    bool
+	jobs                []*fileJob
+	keep                map[string]fileRec // files that are fine as they are, or kept local versions
+	failed              bool
+}
+
+func planSong(o syncOpts, st *syncState, id string, s Song, catalog string, rep *syncReport) *songPlan {
+	folder := filepath.Join(o.lib, id)
+	if fi, err := os.Lstat(folder); err == nil && !fi.IsDir() {
+		rep.add(&rep.failed, fmt.Sprintf("%s: %s is not a folder", id, folder))
+		return nil
+	}
+	rec := st.Songs[id]
+	p := &songPlan{id: id, folder: folder, catalog: catalog, song: s, isNew: rec == nil, keep: map[string]fileRec{}}
+	if rec == nil {
+		rec = &songRec{Files: map[string]fileRec{}}
+	}
+	if rec.Hidden {
+		visible := filepath.Join(folder, rec.Txt)
+		if _, err := os.Lstat(visible); errors.Is(err, fs.ErrNotExist) {
+			os.Rename(visible+hiddenSuffix, visible)
+		}
+		p.wasHidden = true
+	}
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		rep.add(&rep.failed, fmt.Sprintf("%s: %v", id, err))
+		return nil
+	}
+	for _, f := range s.Files {
+		if _, known := roleExt[f.Role]; !known {
+			continue
+		}
+		want := strings.TrimPrefix(f.SHA256, "sha256:")
+		path := filepath.Join(folder, f.Name)
+		old, hasRec := rec.Files[f.Name]
+		have, exists := localHash(path, old, hasRec)
+		switch {
+		case exists && have == want:
+			p.keep[f.Name] = record(path, want)
+		case exists && !o.replaceLocal && (!hasRec || have != old.SHA256):
+			p.keep[f.Name] = record(path, have) // changed here, or not ours: never overwrite without asking (SPEC 5.2)
+			rep.add(&rep.keptLocal, id+"/"+f.Name)
+		default:
+			p.jobs = append(p.jobs, &fileJob{name: f.Name, hex: want, path: path, size: f.Size, txt: f.Role == "txt"})
+		}
+	}
+	return p
+}
+
+func runDownloads(o syncOpts, locs []source, plans []*songPlan, known map[string]string, rep *syncReport, txt bool) {
+	var mu sync.Mutex
+	queue := make(chan *fileJob)
+	var wg sync.WaitGroup
+	for i := 0; i < o.jobs; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range queue {
+				mu.Lock()
+				src := known[j.hex]
+				mu.Unlock()
+				err := errors.New("no copy")
+				if src != "" && src != j.path {
+					err = copyVerified(src, j.path, j.hex, j.size)
+				}
+				if err != nil {
+					var n int64
+					var retries int
+					n, retries, err = fetchBlob(locs, j.hex, j.size, j.path)
+					rep.mu.Lock()
+					rep.downloaded += n
+					rep.retried += retries
+					rep.mu.Unlock()
+				}
+				if err != nil {
+					rep.add(&rep.failed, fmt.Sprintf("%s: %v", j.path, err))
+					continue
+				}
+				j.done = true
+				mu.Lock()
+				known[j.hex] = j.path
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, p := range plans {
+		if txt && slices.ContainsFunc(p.jobs, func(j *fileJob) bool { return !j.txt && !j.done }) {
+			p.failed = true // media incomplete: don't make the song visible
+			continue
+		}
+		for _, j := range p.jobs {
+			if j.txt == txt {
+				queue <- j
+			}
+		}
+	}
+	close(queue)
+	wg.Wait()
+}
+
+// attempts is how often a file is downloaded from one location before the next location is tried. CDNs have been
+// seen to end large downloads early without any error, so an incomplete or wrong file gets two more chances.
+const attempts = 3
+
+// fetchBlob downloads one file into place, trying every location; it is renamed into place only when verified.
+// It returns the bytes transferred and how many attempts had to be repeated.
+func fetchBlob(locs []source, hexsum string, size int64, dest string) (int64, int, error) {
+	rel := "blobs/" + hexsum[:2] + "/" + hexsum
+	var last error = errors.New("no location")
+	var total int64
+	retries := 0
+	for _, s := range locs {
+		for try := 1; try <= attempts; try++ {
+			if try > 1 {
+				retries++
+			}
+			r, _, err := s.open(rel)
+			if err != nil {
+				last = err
+				break // not there, or refused: next location (open already waits on 429/503)
+			}
+			f, err := os.CreateTemp(filepath.Dir(dest), partPrefix+"*")
+			if err != nil {
+				r.Close()
+				return total, retries, err
+			}
+			tmp := f.Name()
+			h := sha256.New()
+			n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, size+1)) // never more than declared (SPEC 5.1.5)
+			r.Close()
+			cerr := f.Close()
+			total += n
+			switch {
+			case err != nil || cerr != nil:
+				last = fmt.Errorf("%s: download broke off after %d of %d bytes: %v", showLoc(s.base), n, size, errors.Join(err, cerr))
+			case n > size:
+				last = fmt.Errorf("%s: larger than the %d bytes the catalog says", showLoc(s.base), size)
+			case n < size:
+				last = fmt.Errorf("%s: got %d of %d bytes (the download ended early)", showLoc(s.base), n, size)
+			case hex.EncodeToString(h.Sum(nil)) != hexsum:
+				last = fmt.Errorf("%s: content does not match its hash", showLoc(s.base))
+			default:
+				return total, retries, os.Rename(tmp, dest)
+			}
+			os.Remove(tmp)
+		}
+	}
+	return total, retries, fmt.Errorf("%v (after %d attempts per location)", last, attempts)
+}
+
+func copyVerified(src, dest, hexsum string, size int64) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.CreateTemp(filepath.Dir(dest), partPrefix+"*")
+	if err != nil {
+		return err
+	}
+	tmp := out.Name()
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(in, size+1))
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && (n != size || hex.EncodeToString(h.Sum(nil)) != hexsum) {
+		err = errors.New("local copy changed")
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dest)
+}
+
+func finishSong(o syncOpts, st *syncState, p *songPlan, rep *syncReport) {
+	rec := st.Songs[p.id]
+	if rec == nil {
+		rec = &songRec{Files: map[string]fileRec{}}
+	}
+	txt := ""
+	files := map[string]fileRec{}
+	for name, f := range p.keep {
+		files[name] = f
+	}
+	for _, j := range p.jobs {
+		if j.done {
+			files[j.name] = record(j.path, j.hex)
+		} else if old, ok := rec.Files[j.name]; ok {
+			files[j.name] = old // update failed: the old file stays
+		}
+		if j.txt {
+			txt = j.name
+		}
+	}
+	for _, f := range p.song.Files {
+		if f.Role == "txt" {
+			txt = f.Name
+		}
+	}
+	if p.failed || slices.ContainsFunc(p.jobs, func(j *fileJob) bool { return !j.done }) {
+		if p.isNew {
+			hideTxt(p.folder, txt) // nothing of it is visible yet; keep it that way
+		}
+		st.Songs[p.id] = &songRec{Catalog: p.catalog, Txt: txt, Hidden: p.isNew || rec.Hidden, Files: files}
+		return
+	}
+	// files the song no longer has: delete them unless changed here
+	for name, old := range rec.Files {
+		if _, still := files[name]; still {
+			continue
+		}
+		path := filepath.Join(p.folder, name)
+		if have, ok := localHash(path, old, true); ok && have == old.SHA256 {
+			os.Remove(path)
+		}
+	}
+	st.Songs[p.id] = &songRec{Catalog: p.catalog, Txt: txt, Files: files}
+	switch {
+	case p.isNew:
+		rep.add(&rep.added, p.id)
+	case p.wasHidden:
+		rep.add(&rep.unhidden, p.id)
+	case len(p.jobs) > 0:
+		rep.add(&rep.updated, p.id)
+	default:
+		rep.add(&rep.unchanged, p.id)
+	}
+}
+
+func hideTxt(folder, txt string) error {
+	if txt == "" {
+		return nil
+	}
+	path := filepath.Join(folder, txt)
+	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return os.Rename(path, path+hiddenSuffix)
+}
+
+// removeSong deletes a song's files, except files changed here; their txt is hidden so the game ignores them.
+func removeSong(folder string, rec *songRec, rep *syncReport) {
+	for name, old := range rec.Files {
+		path := filepath.Join(folder, name)
+		if rec.Hidden && name == rec.Txt {
+			path += hiddenSuffix
+		}
+		have, ok := localHash(path, old, true)
+		switch {
+		case !ok:
+		case have == old.SHA256:
+			os.Remove(path)
+		default:
+			rep.add(&rep.keptLocal, filepath.Base(folder)+"/"+name)
+			if name == rec.Txt && !rec.Hidden {
+				os.Rename(path, path+hiddenSuffix)
+			}
+		}
+	}
+	os.Remove(folder) // only succeeds if empty
+}
+
+func printReport(w io.Writer, r *syncReport) {
+	fmt.Fprintln(w, r.feedNote)
+	for _, l := range []struct {
+		what string
+		ids  []string
+	}{{"added", r.added}, {"updated", r.updated}, {"renamed", r.moved}, {"shown again", r.unhidden},
+		{"hidden (no longer in the feed; files kept)", r.hidden}, {"withdrawn by the operator (deleted)", r.withdrawn},
+		{"removed (catalog or license no longer chosen)", r.removed}} {
+		if len(l.ids) > 0 {
+			fmt.Fprintf(w, "  %s (%d): %s\n", l.what, len(l.ids), list(slices.Clone(l.ids)))
+		}
+	}
+	fmt.Fprintf(w, "  unchanged: %d songs; downloaded %.1f MB\n", len(r.unchanged), float64(r.downloaded)/1e6)
+	if r.retried > 0 {
+		fmt.Fprintf(w, "Note: %d downloads arrived incomplete or damaged and were repeated. If this happens often, the server or CDN cuts off downloads.\n", r.retried)
+	}
+	if len(r.undeclared) > 0 {
+		fmt.Fprintf(w, "Not synced, no license declared (%d): %s\n  → --include-undeclared to sync them anyway\n", len(r.undeclared), list(slices.Clone(r.undeclared)))
+	}
+	if len(r.excluded) > 0 {
+		fmt.Fprintf(w, "Not synced, excluded by your license choice (%d): %s\n  → --exclude \"\" to sync them again\n", len(r.excluded), list(slices.Clone(r.excluded)))
+	}
+	if len(r.keptLocal) > 0 {
+		fmt.Fprintf(w, "Changed in your library, kept as they are (%d): %s\n  → --replace-local to take the feed's version\n", len(r.keptLocal), list(slices.Clone(r.keptLocal)))
+	}
+	for _, s := range r.unsafe {
+		fmt.Fprintln(w, "  skipped, unsafe entry:", s)
+	}
+	for _, s := range r.failed {
+		fmt.Fprintln(w, "  ! ", s)
+	}
+}

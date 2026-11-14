@@ -1,0 +1,13 @@
+# Error log of the karaoke feed on nginx: rotated daily, kept for 14 days.
+# Copy to /etc/logrotate.d/karaoke-feed.
+# The log is in its own folder because the distribution's /etc/logrotate.d/nginx already handles /var/log/nginx/*.log.
+/var/log/nginx/feed/error.log {
+    daily
+    rotate 14
+    maxage 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}

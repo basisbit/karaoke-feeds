@@ -1,0 +1,55 @@
+# Keeps a release pull request open that collects the Conventional Commits on main (CHANGELOG.md, next version).
+# Merging it creates the tag and the GitHub release; then the kfeed binaries are built and attached.
+#
+# Token: pull requests opened with the default GITHUB_TOKEN don't start other workflows, so the release PR
+# would never get its required checks. Store a fine-grained token or GitHub App token with "contents" and
+# "pull requests" write access as the secret RELEASE_PLEASE_TOKEN (see CONTRIBUTING.md, "Releases").
+name: release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  binaries:
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tool/go.mod
+      - name: Build
+        working-directory: tool
+        env:
+          TAG: ${{ needs.release-please.outputs.tag }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p ../dist
+          for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*} arch=${target#*/} ext=""
+            [ "$os" = windows ] && ext=.exe
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o "../dist/kfeed-$TAG-$os-$arch$ext" .
+          done
+          cd ../dist && sha256sum -- * > SHA256SUMS
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: gh release upload "$TAG" dist/* --clobber

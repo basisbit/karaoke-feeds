@@ -1,0 +1,14 @@
+# never commit signing keys
+*.key
+*.pem
+# build output
+bin/
+__pycache__/
+# third-party content, not covered by LICENSE (see the note at its end)
+example-feed/
+research-data/
+# internal working notes, not published (contain unreleased findings and drafts)
+PROGRESS.md
+requirements.md
+research.md
+notes/
