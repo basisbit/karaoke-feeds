@@ -22,6 +22,7 @@ Runs in CI on Linux, Windows and macOS (`.github/workflows/ci.yml`), plus the ra
 | `TestSyncHostileFeed` | path traversal, device names, wrong extensions, invalid ids, oversized files, unknown roles |
 | `TestKeyHandling` | private key from standard input, refusal of key files other users can read, public keys as text or file, a private key given where a public key belongs |
 | `TestPrivateFeed` | private feeds: the settings check, the page, sync through a personal address with a redirect for the big files, no `Referer` to the redirect target, the address neither in messages nor readable in the state folder, access ended, wrong token, a replaced token, the address from standard input |
+| `TestServeOnlyFeedFiles` | `kfeed serve` hands out only the feed's files: no hidden, temporary or other files, nothing outside the folder (also with `\` and drive names on Windows), and the same answer for existing and missing files outside it |
 | `TestFileURL` | `file://` addresses, including `C:` paths on Windows |
 | `TestLandingPage` | the web page: escaping, no inline code, nothing loaded from other sites, song pages, headers from `kfeed serve` |
 | `TestLandingPageLargeFeed`, `TestThousands` | 30,000 songs: the main page stays small (about 5 KB), every song is on its category page, pages of removed categories disappear; number formatting |

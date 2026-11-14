@@ -4,27 +4,37 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
-// feedHandler serves a published feed folder with the headers the spec recommends. No directory listings.
+// servedPath lists what a published feed consists of (SPEC section 2, and the web page). Nothing else in the folder is
+// served: no temporary or hidden files, no folder listings. The same list as in the configurations in hosting/.
+var servedPath = regexp.MustCompile(`^(feed\.json|index\.(html|css|js)|songs-[a-z0-9][a-z0-9._-]{0,63}\.html|sig/[0-9a-f]{64}\.sig|catalog/[0-9a-f]{64}\.json(\.gz)?|blobs/[0-9a-f]{2}/[0-9a-f]{64})$`)
+
+// feedHandler serves a published feed folder with the headers the spec recommends.
 func feedHandler(dir string) http.Handler {
+	// os.DirFS also refuses "..", "\" and drive names on its own, so nothing outside dir can be reached or probed.
+	files := os.DirFS(dir)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		rel := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		rel := strings.TrimPrefix(r.URL.Path, "/")
 		if rel == "" {
 			rel = "index.html"
 		}
-		file := filepath.Join(dir, filepath.FromSlash(rel))
-		if st, err := os.Stat(file); err != nil || !st.Mode().IsRegular() {
+		if !servedPath.MatchString(rel) {
+			http.NotFound(w, r)
+			return
+		}
+		if st, err := fs.Stat(files, rel); err != nil || !st.Mode().IsRegular() {
 			http.NotFound(w, r)
 			return
 		}
@@ -45,7 +55,7 @@ func feedHandler(dir string) http.Handler {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			w.Header().Set("Content-Type", "application/octet-stream") // never guess, never re-encode
 		}
-		http.ServeFile(w, r, file) // handles Range and If-Modified-Since
+		http.ServeFileFS(w, r, files, rel) // handles Range and If-Modified-Since
 	})
 }
 
