@@ -312,6 +312,9 @@ func TestIncompleteDownloads(t *testing.T) {
 	if len(rep.failed) == 0 || !strings.Contains(out, "after 3 attempts") || exists(filepath.Join(r2.lib, "x-a", "a.txt")) {
 		t.Fatalf("expected a failure after 3 attempts and no visible song:\n%s", out)
 	}
+	if cuts.Load() < 3 {
+		t.Fatalf("the server cut off %d downloads, expected at least 3 attempts", cuts.Load())
+	}
 	c = &checker{}
 	verify(newSource(srv.URL+"/feed.json"), "", true, c)
 	if !strings.Contains(strings.Join(c.errs, " "), "of") {
