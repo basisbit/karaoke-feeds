@@ -2,10 +2,14 @@ package kfeed
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -21,6 +25,7 @@ type itemEnv struct {
 	srv      *httptest.Server
 	mu       sync.Mutex
 	blobs    []string // blob requests in order
+	fail     string   // a blob (hex) the server refuses
 	lib, dir string   // library and theme folder
 }
 
@@ -46,7 +51,12 @@ func newItemEnv(t *testing.T, signed bool) *itemEnv {
 		if strings.HasPrefix(r.URL.Path, "/blobs/") {
 			e.mu.Lock()
 			e.blobs = append(e.blobs, filepath.Base(r.URL.Path))
+			fail := e.fail != "" && filepath.Base(r.URL.Path) == e.fail
 			e.mu.Unlock()
+			if fail {
+				http.Error(w, "refused", http.StatusForbidden)
+				return
+			}
 		}
 		files.ServeHTTP(w, r)
 	}))
@@ -99,6 +109,20 @@ func (e *itemEnv) skipped(o Options) []string {
 		e.t.Fatal(err)
 	}
 	return rep.skippedPacks
+}
+
+// unsafe syncs and returns the items that were skipped as unsafe.
+func (e *itemEnv) unsafe(o Options) []string {
+	e.t.Helper()
+	so, err := o.syncOpts(context.Background())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	rep, err := syncLibrary(so, nil)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return rep.unsafe
 }
 
 func TestSyncItems(t *testing.T) {
@@ -308,4 +332,127 @@ func mapsEqual(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// hexOf is the blob name of content.
+func hexOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestItemConflicts: the first item in feed order wins a path, also over a file/folder clash.
+func TestItemConflicts(t *testing.T) {
+	e := newItemEnv(t, true)
+	os.WriteFile(filepath.Join(e.src, configName), []byte(`{"name":"Test Feed","operator":{"name":"Tester","contact":"mailto:takedown@example.com"},"keys":["`+e.pv+`"],
+		"extras": "extras", "catalogs": {"Themes": {"id": "themes", "kind": "theme"}, "A": {"id": "pack-a", "kind": "theme"}, "B": {"id": "pack-b", "kind": "theme"}}}`), 0o644)
+	itemFolder(e.src, "A", "Z", `{"id": "z-theme", "license": {"spdx": "CC0-1.0"}}`, map[string]string{"Shared.ini": "z", "Blue.ini": "blue"})
+	itemFolder(e.src, "B", "A", `{"id": "a-theme", "license": {"spdx": "CC0-1.0"}}`, map[string]string{"Shared.ini": "a"})
+	itemFolder(e.src, "B", "B", `{"id": "b-theme", "license": {"spdx": "CC0-1.0"}}`, map[string]string{"Blue.ini/bg.png": "png"})
+	e.build()
+	unsafe := e.unsafe(e.opts("pack-a", "pack-b"))
+	got := e.files()
+	if got["Shared.ini"] != "z" || got["Blue.ini"] != "blue" || len(got) != 2 {
+		t.Fatalf("theme folder: %v", got)
+	}
+	if len(unsafe) != 2 || !slices.ContainsFunc(unsafe, func(s string) bool { return strings.HasPrefix(s, "a-theme") }) ||
+		!slices.ContainsFunc(unsafe, func(s string) bool { return strings.HasPrefix(s, "b-theme") }) {
+		t.Fatalf("skipped: %q", unsafe)
+	}
+}
+
+// TestItemFileMoves: a file one item drops and another item takes over stays; a dropped file of an update that
+// failed stays recorded and goes when the update completes; other items' part files stay.
+func TestItemFileMoves(t *testing.T) {
+	e := newItemEnv(t, true)
+	e.sync(e.opts("themes"))
+	other := filepath.Join(e.dir, partPrefix+hexOf("someone's unfinished download"))
+	os.WriteFile(other, []byte("half"), 0o644)
+
+	// Blue/bg.png moves from blue-theme to red-theme with the same bytes
+	os.Remove(filepath.Join(e.src, "extras", "Themes", "Blue", "Blue", "bg.png"))
+	itemFolder(e.src, "Themes", "Red", "", map[string]string{"Blue/bg.png": "blue png"})
+	e.build()
+	e.sync(e.opts("themes"))
+	if got := e.files(); got["Blue/bg.png"] != "blue png" {
+		t.Fatalf("moved file deleted: %v", got)
+	}
+	if !exists(other) {
+		t.Fatal("part file of another download deleted")
+	}
+
+	// blue-theme drops Blue/sub/x.png, but its new Blue.ini can't be downloaded: x.png stays until the update is done
+	os.RemoveAll(filepath.Join(e.src, "extras", "Themes", "Blue", "Blue", "sub"))
+	itemFolder(e.src, "Themes", "Blue", "", map[string]string{"Blue.ini": "[Theme]\nName=Blue 3\n"})
+	e.build()
+	e.mu.Lock()
+	e.fail = hexOf("[Theme]\nName=Blue 3\n")
+	e.mu.Unlock()
+	Sync(context.Background(), e.opts("themes"), nil) // reports the failed download
+	if got := e.files(); got["Blue/sub/x.png"] != "x png" {
+		t.Fatalf("dropped file deleted before the update completed: %v", got)
+	}
+	e.mu.Lock()
+	e.fail = ""
+	e.mu.Unlock()
+	e.sync(e.opts("themes"))
+	if got := e.files(); got["Blue/sub/x.png"] != "" || got["Blue.ini"] != "[Theme]\nName=Blue 3\n" {
+		t.Fatalf("after the completed update: %v", got)
+	}
+}
+
+func TestItemLinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links need extra rights on Windows")
+	}
+	e := newItemEnv(t, true)
+	outside := t.TempDir()
+	os.MkdirAll(e.dir, 0o755)
+	if err := os.Symlink(outside, filepath.Join(e.dir, "Blue")); err != nil {
+		t.Fatal(err)
+	}
+	unsafe := e.unsafe(e.opts("themes"))
+	if !slices.ContainsFunc(unsafe, func(s string) bool { return strings.HasPrefix(s, "blue-theme") }) {
+		t.Fatalf("skipped: %q", unsafe)
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("written through the link: %v", entries)
+	}
+}
+
+func TestCheckTargets(t *testing.T) {
+	got, err := checkTargets(map[string]Target{"theme": {Dir: "themes", Extensions: []string{".ini"}}})
+	if err != nil || !filepath.IsAbs(got["theme"].Dir) {
+		t.Fatalf("relative folder: %v %v", got, err)
+	}
+	for _, bad := range []map[string]Target{
+		{"theme": {Extensions: []string{".ini"}}},
+		{"theme": {Dir: "x"}},
+		{"theme": {Dir: "x", Extensions: []string{".INI"}}},
+		{"theme": {Dir: "x", Extensions: []string{"ini"}}},
+		{"songs": {Dir: "x", Extensions: []string{".txt"}}},
+	} {
+		if _, err := checkTargets(bad); err == nil {
+			t.Errorf("accepted %v", bad)
+		}
+	}
+	if _, err := Sync(context.Background(), Options{Address: "x", Library: t.TempDir(), Targets: map[string]Target{"theme": {Dir: "x"}}}, nil); err == nil {
+		t.Error("Sync accepted a target without extensions")
+	}
+}
+
+func TestBuildExtrasOnly(t *testing.T) {
+	e := newItemEnv(t, true)
+	os.RemoveAll(filepath.Join(e.src, "songs"))
+	e.build()
+	data, _ := os.ReadFile(filepath.Join(e.pub, "feed.json"))
+	var f Feed
+	err := json.Unmarshal(data, &f)
+	if err != nil || len(f.Catalogs) != 1 || f.Catalogs[0].Kind != "theme" {
+		t.Fatalf("feed: %+v %v", f, err)
+	}
+	os.RemoveAll(filepath.Join(e.src, "extras", "Themes"))
+	os.MkdirAll(filepath.Join(e.src, "extras"), 0o755)
+	if out, err := run(e.src, e.key, true); err == nil || !strings.Contains(err.Error(), "nothing to publish") {
+		t.Fatalf("empty feed built: %v\n%s", err, out)
+	}
 }

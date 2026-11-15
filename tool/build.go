@@ -641,7 +641,7 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 	// 1. read the songs folder: every top-level folder is one catalog
 	b := &builder{songsDir: songsDir, blobs: map[string]string{}, sizes: map[string]int64{}}
 	top, err := os.ReadDir(songsDir)
-	if err != nil {
+	if err != nil && !(errors.Is(err, fs.ErrNotExist) && cfg.Extras != "") { // a feed may hold only extras
 		return fmt.Errorf("songs folder: %v", err)
 	}
 	type cat struct {
@@ -698,7 +698,7 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 		}
 		cats = append(cats, cat{ref: CatalogRef{ID: cc.ID, Kind: KindSongs, Names: names}, songs: kept, moved: moved})
 	}
-	if len(cats) == 0 {
+	if len(cats) == 0 && cfg.Extras == "" {
 		return fmt.Errorf("no songs found in %s (expected <songs>/<catalog folder>/<song folder>/<song>.txt)", songsDir)
 	}
 	// 1b. packs of other kinds (SPEC 4.4): every folder in "extras" is one pack, every folder in it one item
@@ -749,6 +749,9 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 			sort.Slice(kept, func(i, j int) bool { return kept[i].ID < kept[j].ID })
 			cats = append(cats, cat{ref: CatalogRef{ID: cc.ID, Kind: cc.Kind, Names: names}, items: kept})
 		}
+	}
+	if len(cats) == 0 {
+		return fmt.Errorf("nothing to publish: no songs in %s and no items in %s", songsDir, resolve(cfg.Extras, ""))
 	}
 	for _, id := range removed {
 		if _, live := owner[id]; live {
