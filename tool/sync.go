@@ -234,6 +234,7 @@ type syncPass struct {
 	items      map[string]Item // wanted items of other kinds -> their catalog and kind below
 	itemCat    map[string]string
 	itemKind   map[string]string
+	itemOrder  []string // wanted item ids in feed order (catalogs, then items), for "the first item wins"
 }
 
 // openRun locks the library and loads its state. The caller must call unlock when done.
@@ -363,6 +364,7 @@ func (r *syncPass) loadCatalogs() {
 	moved := map[string]string{}
 	keepCache := map[string]bool{}
 	items, itemCat, itemKind := map[string]Item{}, map[string]string{}, map[string]string{}
+	var itemOrder []string
 	for _, ref := range r.feed.Catalogs {
 		if !r.selected(ref.ID) {
 			continue
@@ -401,6 +403,7 @@ func (r *syncPass) loadCatalogs() {
 					continue
 				}
 				items[it.ID], itemCat[it.ID], itemKind[it.ID] = it, ref.ID, ref.Kind
+				itemOrder = append(itemOrder, it.ID)
 			}
 			continue
 		}
@@ -440,7 +443,7 @@ func (r *syncPass) loadCatalogs() {
 		}
 	}
 	r.wanted, r.songCat, r.byChoice, r.failedCats, r.moved = wanted, songCat, byChoice, failedCats, moved
-	r.items, r.itemCat, r.itemKind = items, itemCat, itemKind
+	r.items, r.itemCat, r.itemKind, r.itemOrder = items, itemCat, itemKind, itemOrder
 }
 
 func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
@@ -505,11 +508,11 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 		}
 		switch {
 		case signed && slices.Contains(feed.Removed, id):
-			removeItem(id, rec, rep)
+			removeItem(st, id, rec, rep)
 			delete(st.Items, id)
 			rep.add(&rep.withdrawn, id)
 		case !selected(rec.Catalog):
-			removeItem(id, rec, rep)
+			removeItem(st, id, rec, rep)
 			delete(st.Items, id)
 			rep.add(&rep.removed, id)
 		}
@@ -540,8 +543,8 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 			plans = append(plans, p)
 		}
 	}
-	claimed := map[string]string{}
-	for _, id := range sortedKeys(r.items) {
+	claimed := newClaims()
+	for _, id := range r.itemOrder {
 		if p := planItem(o, st, id, r.items[id], r.itemCat[id], o.targets[r.itemKind[id]].Dir, claimed, rep); p != nil {
 			plans = append(plans, p)
 		}
@@ -555,7 +558,7 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 	o.progress.finishing()
 	for _, p := range plans {
 		if p.item != nil {
-			finishItem(st, p, rep)
+			finishItem(st, claimed, p, rep)
 		} else {
 			finishSong(o, st, p, rep)
 		}
@@ -1154,6 +1157,15 @@ func removeSong(folder string, rec *songRec, rep *syncReport) {
 			if name == rec.Txt && !rec.Hidden {
 				os.Rename(path, path+hiddenSuffix)
 			}
+		}
+	}
+	// A txt file kfeed did not write (it was there before the first sync) is not in rec.Files and stays, but it is
+	// hidden like an edited one, so that the game no longer lists a song whose media are gone.
+	if _, ours := rec.Files[rec.Txt]; !ours && !rec.Hidden && rec.Txt != "" && partProblem(rec.Txt) == "" {
+		path := filepath.Join(folder, rec.Txt)
+		if fi, err := os.Lstat(path); err == nil && fi.Mode().IsRegular() {
+			rep.add(&rep.keptLocal, filepath.Base(folder)+"/"+rec.Txt)
+			os.Rename(path, path+hiddenSuffix)
 		}
 	}
 	removeParts(folder) // interrupted downloads of this song

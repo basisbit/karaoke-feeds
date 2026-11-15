@@ -441,6 +441,7 @@ func TestKeepLocalOnRemoval(t *testing.T) {
 	song(dir, "Rock", "R", "r.txt", h("Rock", "Song", "r.mp3"), by, "r.mp3")
 	song(dir, "Rock", "T", "t.txt", h("Txt", "Edit", "t.mp3"), by, "t.mp3")
 	song(dir, "Rock", "F", "f.txt", h("Foreign", "File", "f.mp3"), by, "f.mp3")
+	song(dir, "Rock", "G", "g.txt", h("Guest", "Text", "g.mp3"), by, "g.mp3")
 	rebuild(t, dir, "")
 	pub := filepath.Join(dir, "public")
 	lib := filepath.Join(t.TempDir(), "lib")
@@ -448,24 +449,27 @@ func TestKeepLocalOnRemoval(t *testing.T) {
 	in := func(parts ...string) string { return filepath.Join(append([]string{lib}, parts...)...) }
 	os.MkdirAll(in("foreign-file"), 0o755)
 	os.WriteFile(in("foreign-file", "f.mp3"), []byte("someone else's"), 0o644)
+	os.MkdirAll(in("guest-text"), 0o755)
+	os.WriteFile(in("guest-text", "g.txt"), []byte("#TITLE:someone else's txt\n"), 0o644)
 
 	r.ok(pub, syncOpts{all: true}, "foreign-file/f.mp3")
 	os.WriteFile(in("rock-song", "r.mp3"), []byte("my mix"), 0o644)
 	os.WriteFile(in("txt-edit", "t.txt"), []byte("#TITLE:my timing fix\n"), 0o644)
-	r.ok("", syncOpts{}, "kept as they are (3)")
-	r.ok("", syncOpts{}, "kept as they are (3)") // still known as changed on the next run
+	r.ok("", syncOpts{}, "kept as they are (4)")
+	r.ok("", syncOpts{}, "kept as they are (4)") // still known as changed on the next run
 
-	r.ok("", syncOpts{catalogs: []string{"pop"}}, "removed (catalog or license no longer chosen) (3)")
+	r.ok("", syncOpts{catalogs: []string{"pop"}}, "removed (catalog or license no longer chosen) (4)")
 	for p, want := range map[string]string{
-		in("rock-song", "r.mp3"):               "my mix",
-		in("txt-edit", "t.txt") + hiddenSuffix: "#TITLE:my timing fix\n",
-		in("foreign-file", "f.mp3"):            "someone else's",
+		in("rock-song", "r.mp3"):                 "my mix",
+		in("txt-edit", "t.txt") + hiddenSuffix:   "#TITLE:my timing fix\n",
+		in("foreign-file", "f.mp3"):              "someone else's",
+		in("guest-text", "g.txt") + hiddenSuffix: "#TITLE:someone else's txt\n", // foreign txt: kept, but hidden
 	} {
 		if data, err := os.ReadFile(p); err != nil || string(data) != want {
 			t.Errorf("%s: %q %v, want %q", p, data, err, want)
 		}
 	}
-	for _, p := range []string{in("rock-song", "r.txt"), in("txt-edit", "t.txt"), in("txt-edit", "t.mp3"), in("foreign-file", "f.txt")} {
+	for _, p := range []string{in("rock-song", "r.txt"), in("txt-edit", "t.txt"), in("txt-edit", "t.mp3"), in("foreign-file", "f.txt"), in("guest-text", "g.txt"), in("guest-text", "g.mp3")} {
 		if exists(p) {
 			t.Errorf("%s: should be deleted (unchanged, written by kfeed) or hidden", p)
 		}

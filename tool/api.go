@@ -82,8 +82,12 @@ func (o Options) syncOpts(ctx context.Context) (syncOpts, error) {
 	if o.Library == "" {
 		return syncOpts{}, errors.New("no library folder")
 	}
+	targets, err := checkTargets(o.Targets)
+	if err != nil {
+		return syncOpts{}, err
+	}
 	so := syncOpts{ctx: ctx, feed: o.Address, key: o.Key, lib: o.Library, catalogs: slices.Clone(o.Packs), jobs: o.Jobs,
-		seeds: slices.Clone(o.Seeds), targets: o.Targets}
+		seeds: slices.Clone(o.Seeds), targets: targets}
 	if o.Packs != nil && so.catalogs == nil {
 		so.catalogs = []string{}
 	}
@@ -275,11 +279,16 @@ func Fetch(ctx context.Context, url, sha256 string, size int64, dest string, pro
 	s := newSource(dir)
 	s.ctx = ctx
 	part := partPath(dest, hexsum)
+	if _, busy := activeParts.LoadOrStore(part, true); busy {
+		part = "" // another call downloads the same file into this folder: this one doesn't keep a part file
+	} else {
+		defer activeParts.Delete(part)
+	}
 	var t *tracker
 	if progress != nil {
 		t = &tracker{fn: func(p Progress) { progress(p.BytesDone, p.BytesTotal) }}
 		t.p.BytesTotal = size
-		if fi, err := os.Stat(part); err == nil && fi.Size() < size {
+		if fi, err := os.Stat(part); part != "" && err == nil && fi.Size() < size {
 			t.p.BytesDone = fi.Size()
 		}
 		t.send()
