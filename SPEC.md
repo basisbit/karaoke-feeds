@@ -1,4 +1,4 @@
-# Karaoke Feed Format — draft v0.2 (2026-11-14)
+# Karaoke Feed Format — draft v0.3 (2026-11-15)
 
 Status: **working draft**, not published. Key words MUST, SHOULD, MAY as in RFC 2119.
 License: MIT (see `LICENSE`). Anyone may implement this format, including in commercial software.
@@ -6,6 +6,8 @@ Background and reasoning: `DESIGN.md`.
 
 ## 1. Purpose and scope
 A karaoke feed is a set of **static files** that lists UltraStar-format songs and their media, so that games and tools can browse, download on demand, cache and update them. A feed works from any HTTP(S) server, CDN, LAN server, USB stick or local folder.
+
+A feed can also carry other content for the same games, for example themes, in catalogs of another **kind** (§4.4). Clients that only handle songs ignore them.
 
 Out of scope: the UltraStar txt format itself, highscores, uploads by clients, any server-side code.
 
@@ -31,7 +33,7 @@ Terms:
 ## 3. `feed.json`
 ```json
 {
-  "spec": "karaoke-feed/0.2",
+  "spec": "karaoke-feed/0.3",
   "name": "UltraStar Deluxe CC Songs",
   "description": "Creative Commons songs collected by the UltraStar Deluxe project",
   "homepage": "https://github.com/UltraStar-Deluxe/songs",
@@ -44,6 +46,7 @@ Terms:
   "catalogs": [
     {
       "id": "creative-commons",
+      "kind": "songs",
       "names": { "en": "Creative Commons", "de": "Creative Commons" },
       "path": "catalog/<hex>.json.gz",
       "sha256": "sha256:<hex>",
@@ -65,19 +68,21 @@ Terms:
 | `mirrors` | MAY | Other locations serving an identical copy. `http(s)` URLs without query, fragment or user info. |
 | `moved_to` | MAY | `https` URL of the new `feed.json` if the feed moved. See §6.4. |
 | `removed` | MAY | Ids of songs the operator **withdrew** (takedown), see §5.4. A withdrawn id MUST NOT be reused. If an id is listed in a catalog and in `removed`, the catalog wins. Operators MAY drop an entry after one year. The list is in `feed.json` and not in the catalogs, so every subscriber sees it, whatever catalogs they chose. |
-| `catalogs` | MUST | One or more catalog references. A catalog is the unit a user subscribes to and downloads. `path` ends in `.json` or `.json.gz`. `songs` = number of entries; `bytes` = total size of all distinct blobs the catalog references (size of a full mirror). |
+| `catalogs` | MUST | One or more catalog references. A catalog is the unit a user subscribes to and downloads. `kind` (MUST) is `songs` or the name of another kind, `[a-z0-9][a-z0-9-]{0,31}` (§4.4). `path` ends in `.json` or `.json.gz`. `songs` = number of entries of a `songs` catalog, `items` = number of entries of a catalog of another kind; `bytes` = total size of all distinct blobs the catalog references (size of a full mirror). |
 
-**Catalogs partition the feed:** every song `id` appears in exactly one catalog. Cross-cutting groupings (duets, seasons, languages) are expressed with `edition`, `tags`, `genre` and `language`, not with extra catalogs. If a client finds an id in two catalogs it uses the one listed first.
+**Catalogs partition the feed:** every song `id` (and every item `id`, §4.4) appears in exactly one catalog; songs and items share one id space and `removed`. Cross-cutting groupings (duets, seasons, languages) are expressed with `edition`, `tags`, `genre` and `language`, not with extra catalogs. If a client finds an id in two catalogs it uses the one listed first.
 
 ## 4. Catalog files
 ```json
 {
-  "spec": "karaoke-feed/0.2",
+  "spec": "karaoke-feed/0.3",
   "id": "creative-commons",
+  "kind": "songs",
   "songs": [ <song>, ... ],
   "moved": { "old-song-id": "new-song-id" }
 }
 ```
+- `kind` (MUST) is the same as in the catalog reference; a client MUST reject a catalog whose `kind` differs.
 - `moved` (MAY) maps renamed song ids to their new id, so playlists and statistics survive renames.
 - A `.json.gz` catalog is a single gzip member. Clients MUST support gzip and MUST stop decompressing above a limit of their choice (at least 64 MiB).
 
@@ -147,6 +152,33 @@ There is no version number. A song **changed** when the set of (`name`, `sha256`
 | `attribution` | SHOULD | Credit text to show. |
 | `source` | SHOULD | Where the licensed work was obtained (provenance proof). |
 
+### 4.4 Catalogs of other kinds
+A catalog whose `kind` is not `songs` lists **items** instead of songs. An item is a set of files that belong together, for example a theme for a game: a settings file and its images.
+```json
+{
+  "spec": "karaoke-feed/0.3",
+  "id": "extra-themes",
+  "kind": "theme",
+  "items": [
+    { "id": "blue-theme", "names": { "en": "Blue" },
+      "files": [
+        { "path": "Blue.ini", "sha256": "sha256:<hex>", "size": 120, "license": <license> },
+        { "path": "Blue/background.png", "sha256": "sha256:<hex>", "size": 4096, "license": <license> }
+      ] }
+  ]
+}
+```
+| Field | Req. | Meaning |
+|---|---|---|
+| `id` | MUST | Same rule as a song id (§4.1). Unique in the whole feed: songs and items share ids and `removed`. |
+| `names` | SHOULD | Display names per language. |
+| `files` | MUST | One or more files. |
+| `path` | MUST | 1 to 8 parts joined by `/`, at most 400 bytes in total. Every part obeys rules 1 to 4 of §5.2. No two files of one item have the same path compared ASCII-case-insensitively, and no path is a folder of another. |
+| `sha256`, `size` | MUST | As for song files (§4.2). |
+| `license` | MUST | License object (§4.3) with a declared license: `NOLICENSE` is not allowed for items. |
+
+The kind name says what the files are for. This format defines no kind names; a game and the feeds made for it agree on them.
+
 ## 5. Client rules
 ### 5.1 Fetching and verification
 1. Fetch `feed.json` (conditional GET with ETag/If-Modified-Since SHOULD be used). At most 1 MiB. Check `spec` and, for signed feeds, the signature (§6).
@@ -198,6 +230,15 @@ An operator can limit a feed to certain people (members, subscribers, testers) w
 - The server MAY answer requests for blobs with a redirect, for example to a CDN that serves the blobs under their hashes without a token. Whoever knows a hash can then fetch that blob, so the catalogs stay behind the token.
 - The server refuses an unknown or withdrawn token with `403` (or `404`). For the client that is a failed fetch (§5.1, rule 9): the library stays as it is. Ending someone's access does not remove the songs they already have. This is access control for downloads, not copy protection.
 - Clients need no special support, but they treat every location as possibly personal (§5.1, "URLs and privacy").
+
+### 5.6 Other pack kinds
+1. A client MUST ignore catalogs of a kind it does not handle. A game that only plays songs ignores everything but `songs`.
+2. A client MUST install another kind only from a **signed** feed whose key came with the client's own configuration (§6.2: keys built into the game). Not with a key learned on first use, and never from an unsigned feed.
+3. The folder for a kind and the list of allowed file extensions come from the client's configuration, never from the feed. A file is written to `<folder>/<path>`.
+4. A client MUST NOT store a file whose extension is not in that list, and never one of: `.exe .dll .com .bat .cmd .msi .scr .pif .ps1 .vbs .js .jar .sh .so .dylib .lnk .desktop .app .apk .reg`. If one path of an item fails, the client MUST skip the whole item.
+5. A file at one of an item's paths is replaced with the feed's version, also when the client did not write it or it was changed locally: it is the same item, installed or edited by hand (unlike song files, §5.2). Files at other paths are never changed or deleted. If two items want the same path, the first one wins and the second item is skipped.
+6. An item that is simply no longer listed keeps its files. For an id in `removed`, and for an item of a catalog the user no longer chooses, the client deletes the files it wrote and that are unchanged.
+7. "Clients MUST NOT run any downloaded file" (§5.2) applies to every kind.
 
 ## 6. Signatures (optional for clients, see 6.5)
 ### 6.1 Format

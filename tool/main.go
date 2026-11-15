@@ -1,4 +1,4 @@
-// Package kfeed builds, signs, checks and serves karaoke feeds (SPEC.md, karaoke-feed/0.2), and downloads them
+// Package kfeed builds, signs, checks and serves karaoke feeds (SPEC.md, karaoke-feed/0.3), and downloads them
 // into a library folder. The kfeed command is in cmd/kfeed. Standard library only.
 package kfeed
 
@@ -8,7 +8,7 @@ import (
 	"os"
 )
 
-const usageText = `kfeed - build, sign, check and serve karaoke feeds (spec karaoke-feed/0.2)
+const usageText = `kfeed - build, sign, check and serve karaoke feeds (spec karaoke-feed/0.3)
 
 Usage:
   kfeed version                        print the version
@@ -36,6 +36,9 @@ Usage:
         --key <public key>      the feed's key (ed25519:... or a file containing it), if the address doesn't contain it
         --replace-local         replace files you changed with the feed's version
         --jobs <n>              parallel downloads (default 4)
+        --target <kind>=<folder>          where packs of another kind go, e.g. theme=~/.game/themes (repeatable);
+        --extensions <kind>=.ini,.png     with the file extensions allowed there. Only from a signed feed whose
+                                          key you pass with --key or in the address
 
 Guides: docs/player-guide.md, docs/operator-guide.md, docs/signing.md, docs/hosting.md
 `

@@ -55,7 +55,8 @@ type siteSong struct{ Artist, Title, License string }
 
 type siteCatalog struct {
 	ID, Name, Size, Page string
-	Songs                int
+	Kind                 string // "" for songs; else the kind of the pack (SPEC 4.4), which has no song page
+	Songs, Items         int
 	List                 []siteSong
 }
 
@@ -111,6 +112,10 @@ func writeSite(out, publicURL string, private bool, feed Feed, songsByCat [][]So
 		if name == "" {
 			name = ref.ID
 		}
+		if ref.Kind != KindSongs {
+			d.Catalogs = append(d.Catalogs, siteCatalog{ID: ref.ID, Name: name, Kind: ref.Kind, Items: ref.Items, Size: humanSize(ref.Bytes)})
+			continue
+		}
 		c := siteCatalog{ID: ref.ID, Name: name, Songs: ref.Songs, Size: humanSize(ref.Bytes), Page: "songs-" + ref.ID + ".html"}
 		songs := append([]Song(nil), songsByCat[i]...)
 		sort.Slice(songs, func(a, b int) bool {
@@ -154,6 +159,9 @@ func writeSite(out, publicURL string, private bool, feed Feed, songsByCat [][]So
 	}
 	files := map[string]string{"index.html": page.String(), "index.css": siteCSS, "index.js": siteJS}
 	for _, c := range d.Catalogs {
+		if c.Kind != "" {
+			continue
+		}
 		var sp strings.Builder
 		if err := songsTmpl.Execute(&sp, map[string]any{"Feed": d.Name, "Catalog": c, "Version": d.Version, "Repo": d.Repo}); err != nil {
 			return fmt.Errorf("song page: %v", err)

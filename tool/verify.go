@@ -52,13 +52,18 @@ func newSource(arg string) source {
 		return source{base: strings.TrimSuffix(arg, "/") + "/", remote: true, client: c}
 	}
 	if u, err := url.Parse(arg); err == nil && u.Scheme == "file" {
-		arg = u.Path
-		if len(arg) > 2 && arg[0] == '/' && arg[2] == ':' { // file:///C:/feeds/x on Windows
-			arg = arg[1:]
-		}
-		arg = filepath.FromSlash(arg)
+		arg = fileURLPath(u)
 	}
 	return source{base: arg}
+}
+
+// fileURLPath is the local path of a file:// URL.
+func fileURLPath(u *url.URL) string {
+	p := u.Path
+	if len(p) > 2 && p[0] == '/' && p[2] == ':' { // file:///C:/feeds/x on Windows
+		p = p[1:]
+	}
+	return filepath.FromSlash(p)
 }
 
 // showLoc is a location as it may appear in messages and logs. A location can be personal: a private feed has an
@@ -348,7 +353,7 @@ func verify(s source, key string, full bool, c *checker) string {
 	ids := map[string]string{}
 	blobs := map[string]int64{}
 	var order []string
-	songs, undeclared, firstAudio := 0, 0, ""
+	songs, items, undeclared, firstAudio := 0, 0, 0, ""
 	for _, ref := range feed.Catalogs {
 		name := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(ref.Path, "catalog/"), ".gz"), ".json")
 		if !idRe.MatchString(ref.ID) || !hashRe.MatchString(ref.SHA256) || name != strings.TrimPrefix(ref.SHA256, "sha256:") || !strings.Contains(ref.Path, ".json") {
@@ -372,11 +377,60 @@ func verify(s source, key string, full bool, c *checker) string {
 		if cat.Spec != Spec || cat.ID != ref.ID {
 			c.err("catalog %s: spec or id inside the file does not match feed.json", ref.ID)
 		}
+		var total int64
+		seen := map[string]bool{}
+		addBlob := func(sha string, size int64) {
+			sum := strings.TrimPrefix(sha, "sha256:")
+			if old, ok := blobs[sum]; ok && old != size {
+				c.err("blob %s is listed with two different sizes", sum)
+			} else if !ok {
+				order = append(order, sum)
+			}
+			blobs[sum] = size
+			if !seen[sum] {
+				seen[sum] = true
+				total += size
+			}
+		}
+		if !kindRe.MatchString(ref.Kind) {
+			c.err("catalog %s: kind %q is missing or malformed", ref.ID, ref.Kind)
+			continue
+		}
+		if ref.Kind != KindSongs {
+			if len(cat.Songs) > 0 {
+				c.err("catalog %s: a catalog of kind %s can't have songs", ref.ID, ref.Kind)
+			}
+			if len(cat.Items) != ref.Items {
+				c.warn("catalog %s: feed.json says %d items, the catalog has %d", ref.ID, ref.Items, len(cat.Items))
+			}
+			for _, it := range cat.Items {
+				items++
+				if p := itemProblem(it, nil); p != "" {
+					c.err("item %s: %s (clients skip it)", it.ID, p)
+					continue
+				}
+				if other, dup := ids[it.ID]; dup {
+					c.err("id %s is in two catalogs (%s and %s)", it.ID, other, ref.ID)
+				}
+				ids[it.ID] = ref.ID
+				if slices.Contains(feed.Removed, it.ID) {
+					c.err("item %s is listed and also in removed", it.ID)
+				}
+				for _, f := range it.Files {
+					addBlob(f.SHA256, f.Size)
+				}
+			}
+			if total != ref.Bytes {
+				c.warn("catalog %s: feed.json says %d bytes, the files add up to %d", ref.ID, ref.Bytes, total)
+			}
+			continue
+		}
+		if len(cat.Items) > 0 {
+			c.err("catalog %s: a catalog of kind songs can't have items", ref.ID)
+		}
 		if len(cat.Songs) != ref.Songs {
 			c.warn("catalog %s: feed.json says %d songs, the catalog has %d", ref.ID, ref.Songs, len(cat.Songs))
 		}
-		var total int64
-		seen := map[string]bool{}
 		for _, song := range cat.Songs {
 			songs++
 			if !idRe.MatchString(song.ID) {
@@ -423,17 +477,8 @@ func verify(s source, key string, full bool, c *checker) string {
 						c.err("song %s: license %s of %q has no url", song.ID, f.License.SPDX, f.Name)
 					}
 				}
+				addBlob(f.SHA256, f.Size)
 				sum := strings.TrimPrefix(f.SHA256, "sha256:")
-				if old, ok := blobs[sum]; ok && old != f.Size {
-					c.err("blob %s is listed with two different sizes", sum)
-				} else if !ok {
-					order = append(order, sum)
-				}
-				blobs[sum] = f.Size
-				if !seen[sum] {
-					seen[sum] = true
-					total += f.Size
-				}
 				if f.Role == "audio" && firstAudio == "" && f.Size > 1000 {
 					firstAudio = sum
 				}
@@ -523,5 +568,9 @@ func verify(s source, key string, full bool, c *checker) string {
 			checkCDNCache(s, map[string]string{"blobs": rel, "feed.json": "feed.json"}, c)
 		}
 	}
-	return fmt.Sprintf("%q, sequence %d, %s, %d songs in %d catalogs, %d of %d files %s", feed.Name, feed.Sequence, signed, songs, len(feed.Catalogs), len(check), len(order), how)
+	what := fmt.Sprintf("%d songs", songs)
+	if items > 0 {
+		what += fmt.Sprintf(" and %d items", items)
+	}
+	return fmt.Sprintf("%q, sequence %d, %s, %s in %d catalogs, %d of %d files %s", feed.Name, feed.Sequence, signed, what, len(feed.Catalogs), len(check), len(order), how)
 }

@@ -1,0 +1,5 @@
+{
+  "id": "blue-theme",
+  "names": { "en": "Blue", "de": "Blau" },
+  "license": { "spdx": "CC0-1.0", "attribution": "karaoke-feeds example" }
+}

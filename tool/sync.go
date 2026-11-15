@@ -53,6 +53,7 @@ type syncState struct {
 	IncludeUndeclared bool                `json:"include_undeclared"`
 	Exclude           []string            `json:"exclude,omitempty"` // license properties the player doesn't want: nc, nd, sa
 	Songs             map[string]*songRec `json:"songs"`
+	Items             map[string]*itemRec `json:"items,omitempty"` // items of other kinds (items.go)
 }
 
 type syncOpts struct {
@@ -65,9 +66,10 @@ type syncOpts struct {
 	key               string
 	replaceLocal      bool
 	jobs              int
-	ctx               context.Context // nil: not cancellable (command line)
-	progress          *tracker        // nil: no progress reports (command line)
-	seeds             []string        // folders with songs the player has already (seed.go)
+	ctx               context.Context   // nil: not cancellable (command line)
+	progress          *tracker          // nil: no progress reports (command line)
+	seeds             []string          // folders with songs the player has already (seed.go)
+	targets           map[string]Target // kind -> where its items go; kinds without one are left alone
 }
 
 func (o syncOpts) context() context.Context {
@@ -83,6 +85,7 @@ type syncReport struct {
 	added, updated, unchanged, hidden, unhidden, removed []string
 	withdrawn, moved, keptLocal, unsafe, undeclared      []string
 	excluded                                             []string
+	skippedPacks                                         []string // packs of another kind that were left alone
 	failed                                               []string
 	downloaded                                           int64
 	imported                                             int64 // bytes taken from seed folders
@@ -110,11 +113,18 @@ func cmdSync(args []string) error {
 	key := fl.String("key", "", "the feed's public key (ed25519:...) or a file containing it, if not in the address")
 	replace := fl.Bool("replace-local", false, "replace locally changed files with the feed's version")
 	jobs := fl.Int("jobs", 4, "parallel downloads")
+	dirs, exts := targetsFlag{}, targetsFlag{}
+	fl.Var(dirs, "target", "folder for packs of another kind: <kind>=<folder> (repeatable; needs --extensions)")
+	fl.Var(exts, "extensions", "file extensions allowed for a kind: <kind>=.ini,.png (repeatable)")
 	pos, err := parse(fl, args)
 	if err != nil || len(pos) < 1 || len(pos) > 2 || *jobs < 1 || *jobs > 32 {
-		return errors.New("usage: kfeed sync [<feed address> | -] <library folder> [--catalog id]... [--all] [--include-undeclared] [--key ed25519:...] [--replace-local] [--jobs 4]")
+		return errors.New("usage: kfeed sync [<feed address> | -] <library folder> [--catalog id]... [--all] [--include-undeclared] [--key ed25519:...] [--replace-local] [--jobs 4] [--target <kind>=<folder> --extensions <kind>=.a,.b (repeatable)]")
 	}
-	o := syncOpts{lib: pos[len(pos)-1], key: *key, all: *all, replaceLocal: *replace, jobs: *jobs}
+	targets, err := cliTargets(dirs, exts)
+	if err != nil {
+		return err
+	}
+	o := syncOpts{lib: pos[len(pos)-1], key: *key, all: *all, replaceLocal: *replace, jobs: *jobs, targets: targets}
 	if len(pos) == 2 {
 		o.feed = pos[0]
 	}
@@ -177,7 +187,7 @@ func accessNote(err error) string {
 }
 
 func loadState(dir string) (*syncState, error) {
-	st := &syncState{Songs: map[string]*songRec{}}
+	st := &syncState{Songs: map[string]*songRec{}, Items: map[string]*itemRec{}}
 	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return st, nil
@@ -190,6 +200,9 @@ func loadState(dir string) (*syncState, error) {
 	}
 	if st.Songs == nil {
 		st.Songs = map[string]*songRec{}
+	}
+	if st.Items == nil {
+		st.Items = map[string]*itemRec{}
 	}
 	return st, nil
 }
@@ -217,6 +230,10 @@ type syncPass struct {
 	byChoice   map[string]bool // not synced because of the player's license choice
 	failedCats map[string]bool
 	moved      map[string]string
+	keyGiven   bool            // the caller passed the key (SPEC 5.6 rule 2), not only learned from the state
+	items      map[string]Item // wanted items of other kinds -> their catalog and kind below
+	itemCat    map[string]string
+	itemKind   map[string]string
 }
 
 // openRun locks the library and loads its state. The caller must call unlock when done.
@@ -251,6 +268,7 @@ func (r *syncPass) fetchFeed() error {
 	if fragKey != "" && o.key == "" {
 		o.key = "ed25519:" + fragKey
 	}
+	r.keyGiven = o.key != ""
 	if o.key != "" {
 		var err error
 		if o.key, err = publicKeyArg(o.key); err != nil {
@@ -320,6 +338,10 @@ func (r *syncPass) choose(w io.Writer) error {
 	if st.Catalogs == nil {
 		fmt.Fprintf(w, "Feed %q (%s) has these catalogs:\n", feed.Name, feed.Operator.Name)
 		for _, c := range feed.Catalogs {
+			if c.Kind != KindSongs {
+				fmt.Fprintf(w, "  %-24s %-30s %5d items %9.1f MB (kind %s: needs --target and --extensions)\n", c.ID, c.Names["en"], c.Items, float64(c.Bytes)/1e6, c.Kind)
+				continue
+			}
 			fmt.Fprintf(w, "  %-24s %-30s %5d songs %9.1f MB\n", c.ID, c.Names["en"], c.Songs, float64(c.Bytes)/1e6)
 		}
 		fmt.Fprintln(w, "Choose with --catalog <id> (repeatable) or --all, then run again.")
@@ -340,9 +362,24 @@ func (r *syncPass) loadCatalogs() {
 	failedCats := map[string]bool{}
 	moved := map[string]string{}
 	keepCache := map[string]bool{}
+	items, itemCat, itemKind := map[string]Item{}, map[string]string{}, map[string]string{}
 	for _, ref := range r.feed.Catalogs {
 		if !r.selected(ref.ID) {
 			continue
+		}
+		var target Target
+		if ref.Kind != KindSongs {
+			var ok bool
+			if target, ok = r.o.targets[ref.Kind]; !ok || !kindRe.MatchString(ref.Kind) {
+				failedCats[ref.ID] = true // left alone: its installed items stay as they are
+				rep.add(&rep.skippedPacks, fmt.Sprintf("%s: no folder for kind %q", ref.ID, ref.Kind))
+				continue
+			}
+			if !r.signed || !r.keyGiven {
+				failedCats[ref.ID] = true
+				rep.add(&rep.skippedPacks, fmt.Sprintf("%s: a pack of kind %q needs a signed feed and its key", ref.ID, ref.Kind))
+				continue
+			}
 		}
 		name := filepath.Base(ref.Path)
 		keepCache[name] = true
@@ -352,10 +389,28 @@ func (r *syncPass) loadCatalogs() {
 			rep.add(&rep.failed, fmt.Sprintf("catalog %s: %v", ref.ID, err))
 			continue
 		}
+		if ref.Kind != KindSongs {
+			for _, it := range cat.Items {
+				_, song := wanted[it.ID]
+				if _, dup := items[it.ID]; dup || song || filtered[it.ID] {
+					continue // first catalog wins (SPEC 3)
+				}
+				if p := itemProblem(it, target.Extensions); p != "" {
+					filtered[it.ID] = true
+					rep.add(&rep.unsafe, fmt.Sprintf("%s: %s", it.ID, p))
+					continue
+				}
+				items[it.ID], itemCat[it.ID], itemKind[it.ID] = it, ref.ID, ref.Kind
+			}
+			continue
+		}
 		for old, nu := range cat.Moved {
 			moved[old] = nu
 		}
 		for _, s := range cat.Songs {
+			if _, item := items[s.ID]; item {
+				continue
+			}
 			if _, dup := wanted[s.ID]; dup || filtered[s.ID] {
 				continue // first catalog wins (SPEC 3)
 			}
@@ -385,6 +440,7 @@ func (r *syncPass) loadCatalogs() {
 		}
 	}
 	r.wanted, r.songCat, r.byChoice, r.failedCats, r.moved = wanted, songCat, byChoice, failedCats, moved
+	r.items, r.itemCat, r.itemKind = items, itemCat, itemKind
 }
 
 func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
@@ -443,12 +499,34 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 			rep.add(&rep.hidden, id)
 		}
 	}
+	for id, rec := range st.Items { // SPEC 5.6 rule 6: an item no longer listed keeps its files
+		if _, ok := r.items[id]; ok || failedCats[rec.Catalog] {
+			continue
+		}
+		switch {
+		case signed && slices.Contains(feed.Removed, id):
+			removeItem(id, rec, rep)
+			delete(st.Items, id)
+			rep.add(&rep.withdrawn, id)
+		case !selected(rec.Catalog):
+			removeItem(id, rec, rep)
+			delete(st.Items, id)
+			rep.add(&rep.removed, id)
+		}
+	}
 
 	// 6. bring every wanted song up to date
 	known := map[string]string{} // blob hex -> a verified local file with it
 	for id, rec := range st.Songs {
 		for name, f := range rec.Files {
 			known[f.SHA256] = filepath.Join(o.lib, id, name)
+		}
+	}
+	for _, rec := range st.Items {
+		for name, f := range rec.Files {
+			if safeItemPath(name) {
+				known[f.SHA256] = filepath.Join(rec.Dir, filepath.FromSlash(name))
+			}
 		}
 	}
 	plans := []*songPlan{}
@@ -462,6 +540,12 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 			plans = append(plans, p)
 		}
 	}
+	claimed := map[string]string{}
+	for _, id := range sortedKeys(r.items) {
+		if p := planItem(o, st, id, r.items[id], r.itemCat[id], o.targets[r.itemKind[id]].Dir, claimed, rep); p != nil {
+			plans = append(plans, p)
+		}
+	}
 	o.progress.start(plans)
 	stop := o.progress.every(500 * time.Millisecond)
 	seeds := indexSeeds(o.context(), o.seeds, o.lib)
@@ -470,7 +554,11 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 	stop()
 	o.progress.finishing()
 	for _, p := range plans {
-		finishSong(o, st, p, rep)
+		if p.item != nil {
+			finishItem(st, p, rep)
+		} else {
+			finishSong(o, st, p, rep)
+		}
 	}
 
 	// 7. save
@@ -691,7 +779,8 @@ type songPlan struct {
 	jobs                []*fileJob
 	keep                map[string]fileRec // files that are fine as they are, or kept local versions
 	failed              bool
-	left                int // jobs not processed yet; guarded by the tracker
+	left                int   // jobs not processed yet; guarded by the tracker
+	item                *Item // set for an item of another kind (items.go); song then only holds its name
 }
 
 // fileAction decides what a sync does with one file of a wanted song: keep the local file (keep is its record, and
@@ -742,10 +831,16 @@ func planSong(o syncOpts, st *syncState, id string, s Song, catalog string, rep 
 			p.jobs = append(p.jobs, &fileJob{name: f.Name, hex: want, path: path, size: f.Size, txt: f.Role == "txt", plan: p})
 			continue
 		}
-		p.keep[f.Name] = keep
 		if local {
+			// Changed here, or not written by us: kept. Its record stays what we wrote (or none for a foreign file),
+			// so that removing the song later still sees the change and keeps the file (SPEC 5.2).
+			if old, ours := rec.Files[f.Name]; ours {
+				p.keep[f.Name] = old
+			}
 			rep.add(&rep.keptLocal, id+"/"+f.Name)
+			continue
 		}
+		p.keep[f.Name] = keep
 	}
 	return p
 }
@@ -1092,6 +1187,9 @@ func printReport(w io.Writer, r *syncReport) {
 	}
 	for _, s := range r.unsafe {
 		fmt.Fprintln(w, "  skipped, unsafe entry:", s)
+	}
+	for _, s := range r.skippedPacks {
+		fmt.Fprintln(w, "  skipped pack:", s)
 	}
 	for _, s := range r.failed {
 		fmt.Fprintln(w, "  ! ", s)

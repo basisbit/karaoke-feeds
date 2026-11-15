@@ -5,8 +5,12 @@ package kfeed
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,8 +31,10 @@ type Info struct {
 // Pack is one catalog of a feed.
 type Pack struct {
 	ID     string
+	Kind   string            // "songs", or another kind such as "theme" (installed only with a Target for it)
 	Names  map[string]string // language -> name
 	Songs  int
+	Items  int // entries of a pack of another kind
 	Bytes  int64
 	Chosen bool // currently selected in this library
 }
@@ -44,6 +50,9 @@ type Options struct {
 	// Seeds are folders with songs the player has already (for example an older installation): files with the same
 	// content are taken from there (hard link, or copy) instead of being downloaded. The folders are not changed.
 	Seeds []string
+	// Targets says where packs of other kinds go (kind -> folder and allowed extensions). They are installed only
+	// from a signed feed whose Key is passed here; packs of a kind without a target are left alone.
+	Targets map[string]Target
 }
 
 // Progress is sent often while Sync works; reading it must be cheap.
@@ -74,7 +83,7 @@ func (o Options) syncOpts(ctx context.Context) (syncOpts, error) {
 		return syncOpts{}, errors.New("no library folder")
 	}
 	so := syncOpts{ctx: ctx, feed: o.Address, key: o.Key, lib: o.Library, catalogs: slices.Clone(o.Packs), jobs: o.Jobs,
-		seeds: slices.Clone(o.Seeds)}
+		seeds: slices.Clone(o.Seeds), targets: o.Targets}
 	if o.Packs != nil && so.catalogs == nil {
 		so.catalogs = []string{}
 	}
@@ -111,7 +120,7 @@ func Inspect(ctx context.Context, o Options) (*Info, error) {
 		OperatorContact: f.Operator.Contact, Signed: r.signed, Subscribed: r.st.Catalogs != nil}
 	all := slices.Contains(r.st.Catalogs, "*")
 	for _, c := range f.Catalogs {
-		info.Packs = append(info.Packs, Pack{ID: c.ID, Names: c.Names, Songs: c.Songs, Bytes: c.Bytes,
+		info.Packs = append(info.Packs, Pack{ID: c.ID, Kind: c.Kind, Names: c.Names, Songs: c.Songs, Items: c.Items, Bytes: c.Bytes,
 			Chosen: all || slices.Contains(r.st.Catalogs, c.ID)})
 	}
 	return info, nil
@@ -182,6 +191,30 @@ func (r *syncPass) plan() (int64, int) {
 			songs++
 		}
 	}
+	for id, it := range r.items {
+		dir := r.o.targets[r.itemKind[id]].Dir
+		rec := &songRec{}
+		if ir := r.st.Items[id]; ir != nil && filepath.Clean(ir.Dir) == filepath.Clean(dir) {
+			rec.Files = ir.Files
+		}
+		need := false
+		for _, f := range it.Files {
+			target := filepath.Join(dir, filepath.FromSlash(f.Path))
+			if _, _, download := fileAction(itemOpts(r.o), target, File{Name: f.Path, SHA256: f.SHA256, Size: f.Size}, rec); !download {
+				continue
+			}
+			if h := strings.TrimPrefix(f.SHA256, "sha256:"); !known[h] {
+				known[h] = true
+				if !seeds.has(f.Size) {
+					bytes += f.Size
+				}
+			}
+			need = true
+		}
+		if need {
+			songs++
+		}
+	}
 	return bytes, songs
 }
 
@@ -208,6 +241,91 @@ func Sync(ctx context.Context, o Options, progress func(Progress)) (*Result, err
 		err = ctx.Err()
 	}
 	return res, err
+}
+
+// Verify reports whether sig (base64url, as in a feed's sig/<hash>.sig file) is a signature of msg by one of keys
+// ("ed25519:<base64url>").
+func Verify(keys []string, msg []byte, sig string) bool {
+	return sigValid(keys, msg, sig)
+}
+
+// Sign signs msg with the private key in keyFile ("-" reads it from standard input), the same way "kfeed build"
+// signs a feed. It returns the signature (base64url without padding) and the matching public key.
+func Sign(keyFile string, msg []byte) (sig, publicKey string, err error) {
+	priv, err := loadKey(keyFile)
+	if err != nil {
+		return "", "", err
+	}
+	sig = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, msg))
+	return sig, pubString(priv.Public().(ed25519.PublicKey)), nil
+}
+
+// Fetch downloads one file from url (http, https, or a local path) to dest with the same code as feed files: the
+// size and SHA-256 hash ("sha256:<hex>" or "<hex>") are checked before dest is written, and an interrupted download
+// is kept next to dest and continued by the next call. progress may be nil.
+func Fetch(ctx context.Context, url, sha256 string, size int64, dest string, progress func(done, total int64)) error {
+	hexsum := strings.TrimPrefix(sha256, "sha256:")
+	if !hexRe.MatchString(hexsum) {
+		return fmt.Errorf("%q is not a SHA-256 hash", sha256)
+	}
+	dir, name, ok := splitAddress(url)
+	if !ok {
+		return fmt.Errorf("%s does not name a file", showLoc(url))
+	}
+	s := newSource(dir)
+	s.ctx = ctx
+	part := partPath(dest, hexsum)
+	var t *tracker
+	if progress != nil {
+		t = &tracker{fn: func(p Progress) { progress(p.BytesDone, p.BytesTotal) }}
+		t.p.BytesTotal = size
+		if fi, err := os.Stat(part); err == nil && fi.Size() < size {
+			t.p.BytesDone = fi.Size()
+		}
+		t.send()
+		defer t.every(500 * time.Millisecond)()
+	}
+	var err error
+	for try := 1; try <= attempts; try++ {
+		var next bool
+		_, next, err = fetchOnce(s, name, hexsum, size, dest, part, t)
+		if err == nil {
+			t.send()
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if next {
+			break
+		}
+	}
+	return err
+}
+
+// splitAddress splits the address of one file into its folder (for newSource) and its name: an http(s) address at
+// the last "/" before a query (the query stays with the name), a file:// URL or a path of this system (also
+// C:\games\app.zip on Windows) into folder and file name.
+func splitAddress(addr string) (dir, name string, ok bool) {
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		end := len(addr)
+		if i := strings.IndexAny(addr, "?#"); i >= 0 {
+			end = i
+		}
+		cut := strings.LastIndex(addr[:end], "/")
+		if cut < strings.Index(addr, "://")+3 || cut == end-1 {
+			return "", "", false
+		}
+		return addr[:cut+1], addr[cut+1:], true
+	}
+	p := addr
+	if u, err := url.Parse(addr); err == nil && u.Scheme == "file" {
+		p = fileURLPath(u)
+	}
+	if p == "" || strings.HasSuffix(p, "/") || strings.HasSuffix(p, string(filepath.Separator)) {
+		return "", "", false
+	}
+	return filepath.Dir(p), filepath.Base(p), true
 }
 
 // tracker collects the progress of a sync. All methods may be called on a nil tracker; they then do nothing.
@@ -301,7 +419,10 @@ func (t *tracker) working(s Song) {
 		return
 	}
 	t.mu.Lock()
-	t.p.Current = s.Artist + " - " + s.Title
+	t.p.Current = s.Title
+	if s.Artist != "" { // items of other kinds have only a name
+		t.p.Current = s.Artist + " - " + s.Title
+	}
 	t.mu.Unlock()
 }
 
