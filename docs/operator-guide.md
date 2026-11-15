@@ -191,6 +191,26 @@ Each folder directly inside `songs/` is a category ("catalog"). Its id is made f
 
 A song belongs to exactly one category. For groupings across categories (duets, a season, a language) use the txt headers `#EDITION`, `#GENRE`, `#LANGUAGE` and `#TAGS`.
 
+### Other content: themes and more
+
+A feed can also carry packs of other content for the same games, for example themes. Such a pack has a **kind** (`theme`, or any other name of `a-z`, `0-9` and `-` that the game and you agree on) and holds **items**: one item is a set of files that belong together.
+
+1. Add `"extras": "extras"` to `feed-config.json` (a folder next to `songs/`, or any other path).
+2. Every folder in `extras/` is one pack. Give it a kind (and, as for categories, an id and names) in `catalogs`:
+   ```json
+   "catalogs": {
+     "Themes": { "id": "themes", "kind": "theme", "names": { "de": "Designs" } }
+   }
+   ```
+3. Every folder in a pack is one item. Put its files inside, in the layout the game expects below its folder for that kind, for example `extras/Themes/Blue/Blue.ini` and `extras/Themes/Blue/Blue/background.png`. Hidden files (starting with `.`) are left out.
+4. Every item needs a `feed-meta.json` with a license for all its files (`NOLICENSE` is not allowed for items), and optionally an id and names:
+   ```json
+   { "id": "blue-theme", "names": { "en": "Blue", "de": "Blau" }, "license": { "spdx": "CC0-1.0" } }
+   ```
+   Without an id, it is made from the folder name. Ids of songs and items share one list: they must not repeat, and `removed.txt` works for both.
+
+Games install other kinds only from **signed** feeds that they were set up with, and only file types they allow (never programs such as `.exe`, `.sh` or `.js`; `kfeed build` refuses those). Games replace files at an item's paths with your version, even ones the player installed or changed by hand, so give every item its own folder and file names. The folder in `example-source/extras/` shows a complete example.
+
 ## 9. Check and publish
 
 ```

@@ -101,6 +101,10 @@ Later updates need only the folder, as usual. `kfeed` keeps the address in the f
 | `--key ed25519:…` | the feed's key, if the address doesn't contain it; also a file containing the key (`--key feed.pub`) |
 | `--replace-local` | replace files you changed with the feed's version |
 | `--jobs <n>` | parallel downloads (default 4) |
+| `--target <kind>=<folder>` | where packs of another kind go, for example `--target theme=~/.game/themes`. Repeat for several kinds. Needs `--extensions` for the same kind. |
+| `--extensions <kind>=.ini,.png` | the file types allowed in that folder. Programs and scripts (`.exe`, `.sh`, `.js`, …) are never stored. |
+
+Packs of another kind (for example themes, see `kfeed sync` without `--catalog` for the list) are installed only from a **signed** feed whose key you give with `--key` or in the address, and only into a folder you name with `--target`. Without that, `kfeed sync` leaves them alone and says so. A file at the same place as one of the pack's files (for example an older copy of the same theme you installed by hand, or a file of it you changed) is replaced with the feed's version. Other files in that folder are never touched. When you stop choosing such a pack, the files `kfeed` wrote are deleted; files you changed since the last sync, and files you added, stay.
 
 ## 7. Good to know
 

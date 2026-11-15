@@ -63,13 +63,15 @@
     {{range .Catalogs}}
       <article class="card">
         <h3>{{.Name}}</h3>
-        <p class="meta">id <code>{{.ID}}</code> · {{num .Songs}} songs · {{.Size}}</p>
+        {{if .Kind}}<p class="meta">id <code>{{.ID}}</code> · kind <code>{{.Kind}}</code> · {{num .Items}} items · {{.Size}}</p>
+        <p>Extra content for games that know the kind “{{.Kind}}”. Games install it only from signed feeds they were set up with.</p>
+        {{else}}<p class="meta">id <code>{{.ID}}</code> · {{num .Songs}} songs · {{.Size}}</p>
         {{if $.Inline}}<details open>
           <summary>Songs</summary>
           <ul class="songs">
           {{range .List}}<li><span class="artist">{{.Artist}}</span> – {{.Title}}<span class="lic">{{.License}}</span></li>
           {{end}}</ul>
-        </details>{{else}}<p><a class="button" href="{{.Page}}">Browse the {{num .Songs}} songs</a></p>{{end}}
+        </details>{{else}}<p><a class="button" href="{{.Page}}">Browse the {{num .Songs}} songs</a></p>{{end}}{{end}}
       </article>
     {{end}}
     </div>

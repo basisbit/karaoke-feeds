@@ -108,7 +108,7 @@ func TestLandingPageLargeFeed(t *testing.T) {
 	var songs [][]Song
 	for c := 0; c < 3; c++ {
 		id := fmt.Sprintf("cat-%d", c)
-		feed.Catalogs = append(feed.Catalogs, CatalogRef{ID: id, Names: map[string]string{"en": id}, Songs: 10000, Bytes: 5e10})
+		feed.Catalogs = append(feed.Catalogs, CatalogRef{ID: id, Kind: KindSongs, Names: map[string]string{"en": id}, Songs: 10000, Bytes: 5e10})
 		var list []Song
 		for i := 0; i < 10000; i++ {
 			list = append(list, Song{ID: fmt.Sprintf("s%d-%d", c, i), Artist: fmt.Sprintf("Artist %d", i%700), Title: fmt.Sprintf("Song number %d-%d", c, i),

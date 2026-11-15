@@ -2,9 +2,23 @@
   "name": "UltraStar Deluxe CC Songs (prototype)",
   "description": "Prototype feed built from github.com/UltraStar-Deluxe/songs. Not an official feed.",
   "homepage": "https://github.com/UltraStar-Deluxe/songs",
-  "operator": { "name": "PROTOTYPE - not an official feed", "contact": "mailto:copyright@usdx.eu" },
+  "operator": {
+    "name": "PROTOTYPE - not an official feed",
+    "contact": "mailto:copyright@usdx.eu"
+  },
   "songs": "../../songs",
   "output": "../example-feed",
   "keys": [],
-  "mirrors": []
+  "mirrors": [],
+  "extras": "extras",
+  "catalogs": {
+    "Themes": {
+      "id": "example-themes",
+      "kind": "theme",
+      "names": {
+        "en": "Themes",
+        "de": "Themes"
+      }
+    }
+  }
 }

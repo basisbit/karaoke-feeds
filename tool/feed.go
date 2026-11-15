@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -19,7 +20,8 @@ import (
 )
 
 const (
-	Spec        = "karaoke-feed/0.2"
+	Spec        = "karaoke-feed/0.3"
+	KindSongs   = "songs"
 	maxFeedSize = 1 << 20
 	maxCatalog  = 64 << 20
 )
@@ -31,11 +33,13 @@ type Operator struct {
 
 type CatalogRef struct {
 	ID     string            `json:"id"`
+	Kind   string            `json:"kind"` // "songs" or another kind (SPEC 4.4)
 	Names  map[string]string `json:"names,omitempty"`
 	Path   string            `json:"path"`
 	SHA256 string            `json:"sha256"`
 	Size   int64             `json:"size"`
-	Songs  int               `json:"songs"`
+	Songs  int               `json:"songs,omitempty"`
+	Items  int               `json:"items,omitempty"`
 	Bytes  int64             `json:"bytes"`
 }
 
@@ -93,8 +97,25 @@ type Song struct {
 type Catalog struct {
 	Spec  string            `json:"spec"`
 	ID    string            `json:"id"`
-	Songs []Song            `json:"songs"`
+	Kind  string            `json:"kind"`
+	Songs []Song            `json:"songs,omitempty"`
+	Items []Item            `json:"items,omitempty"`
 	Moved map[string]string `json:"moved,omitempty"`
+}
+
+// Item is an entry of a catalog of another kind than songs, for example a theme (SPEC 4.4).
+type Item struct {
+	ID    string            `json:"id"`
+	Names map[string]string `json:"names,omitempty"`
+	Files []ItemFile        `json:"files"`
+}
+
+// ItemFile is a file of an item. Path is relative to the folder the client chose for the kind.
+type ItemFile struct {
+	Path    string   `json:"path"`
+	SHA256  string   `json:"sha256"`
+	Size    int64    `json:"size"`
+	License *License `json:"license"`
 }
 
 var (
@@ -102,6 +123,7 @@ var (
 	hashRe   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	hexRe    = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	deviceRe = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com[0-9]|lpt[0-9])$`)
+	kindRe   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 	ccRe     = regexp.MustCompile(`^CC-(BY(?:-NC)?(?:-ND|-SA)?)-(\d\.\d)(?:-([A-Z]{2,3}))?$`)
 
 	audioExt = []string{".mp3", ".ogg", ".opus", ".m4a", ".flac", ".wav"}
@@ -111,6 +133,9 @@ var (
 		"video": {".mp4", ".webm", ".mkv", ".avi", ".mpg", ".mov"}, "cover": imageExt, "background": imageExt,
 		"license": {".txt", ".md"},
 	}
+	// blockedExt can never be stored for an item, whatever the client's configuration allows (SPEC 5.6 rule 4).
+	blockedExt = []string{".exe", ".dll", ".com", ".bat", ".cmd", ".msi", ".scr", ".pif", ".ps1", ".vbs", ".js", ".jar",
+		".sh", ".so", ".dylib", ".lnk", ".desktop", ".app", ".apk", ".reg"}
 	mimeTypes = map[string]string{
 		".txt": "text/plain", ".md": "text/markdown", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/opus",
 		".m4a": "audio/mp4", ".flac": "audio/flac", ".wav": "audio/wav", ".mp4": "video/mp4", ".webm": "video/webm",
@@ -121,6 +146,21 @@ var (
 
 // nameProblem implements SPEC 5.2 rules 1-5. It returns "" if the name is acceptable for the role.
 func nameProblem(name, role string) string {
+	if p := partProblem(name); p != "" {
+		return p
+	}
+	exts, ok := roleExt[role]
+	if !ok {
+		return "has the unknown role " + role
+	}
+	if ext := strings.ToLower(filepath.Ext(name)); !slices.Contains(exts, ext) {
+		return fmt.Sprintf("has extension %q, which is not allowed for role %s", ext, role)
+	}
+	return ""
+}
+
+// partProblem implements SPEC 5.2 rules 1-4 for one file or folder name.
+func partProblem(name string) string {
 	switch {
 	case len(name) == 0 || len(name) > 160:
 		return "must be 1 to 160 bytes long"
@@ -137,12 +177,56 @@ func nameProblem(name, role string) string {
 	case deviceRe.MatchString(strings.SplitN(name, ".", 2)[0]):
 		return "is a Windows device name"
 	}
-	exts, ok := roleExt[role]
-	if !ok {
-		return "has the unknown role " + role
+	return ""
+}
+
+// Blocked reports whether files with this extension (lower case, with the dot) must never be stored for an item of
+// another kind, whatever a client's configuration allows (SPEC 5.6 rule 4).
+func Blocked(ext string) bool { return slices.Contains(blockedExt, ext) }
+
+// itemProblem implements the checks of SPEC 4.4 and 5.6 for one item. exts is the client's list of allowed
+// extensions for the item's kind (lower case, with the dot); nil checks only the block list (generator, verify).
+// It returns "" if the item is acceptable.
+func itemProblem(it Item, exts []string) string {
+	if !idRe.MatchString(it.ID) {
+		return "invalid id"
 	}
-	if ext := strings.ToLower(filepath.Ext(name)); !slices.Contains(exts, ext) {
-		return fmt.Sprintf("has extension %q, which is not allowed for role %s", ext, role)
+	if len(it.Files) == 0 {
+		return "has no files"
+	}
+	paths := map[string]bool{}
+	for _, f := range it.Files {
+		parts := strings.Split(f.Path, "/")
+		if len(f.Path) > 400 || len(parts) > 8 {
+			return fmt.Sprintf("path %q is longer than 400 bytes or 8 parts", f.Path)
+		}
+		for _, part := range parts {
+			if p := partProblem(part); p != "" {
+				return fmt.Sprintf("path %q: %q %s", f.Path, part, p)
+			}
+		}
+		ext := strings.ToLower(filepath.Ext(f.Path))
+		if slices.Contains(blockedExt, ext) || (exts != nil && !slices.Contains(exts, ext)) {
+			return fmt.Sprintf("path %q: extension %q is not allowed", f.Path, ext)
+		}
+		lower := strings.ToLower(f.Path)
+		if paths[lower] {
+			return fmt.Sprintf("path %q is there twice (upper/lower case ignored)", f.Path)
+		}
+		paths[lower] = true
+		if !hashRe.MatchString(f.SHA256) || f.Size < 0 {
+			return fmt.Sprintf("file %q has a malformed sha256 or size", f.Path)
+		}
+		if l := f.License; l == nil || l.SPDX == "" || l.SPDX == "NOLICENSE" || l.URL == "" {
+			return fmt.Sprintf("file %q has no declared license", f.Path)
+		}
+	}
+	for p := range paths { // a file "a" and a file "a/b" can't both exist
+		for dir := path.Dir(p); dir != "."; dir = path.Dir(dir) {
+			if paths[dir] {
+				return fmt.Sprintf("path %q is a file and also a folder", dir)
+			}
+		}
 	}
 	return ""
 }
@@ -222,6 +306,9 @@ func decodeCatalog(ref CatalogRef, stored []byte) (*Catalog, error) {
 	var c Catalog
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, err
+	}
+	if c.Kind != ref.Kind {
+		return nil, fmt.Errorf("the catalog is of kind %q, feed.json says %q", c.Kind, ref.Kind)
 	}
 	return &c, nil
 }

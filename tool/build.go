@@ -33,6 +33,7 @@ type Config struct {
 	Homepage    string                `json:"homepage"`
 	Operator    Operator              `json:"operator"`
 	Songs       string                `json:"songs"`
+	Extras      string                `json:"extras"` // packs of other kinds: <extras>/<pack folder>/<item folder>/...
 	Output      string                `json:"output"`
 	Keys        []string              `json:"keys"`
 	Mirrors     []string              `json:"mirrors"`
@@ -42,10 +43,19 @@ type Config struct {
 	Catalogs    map[string]CatalogCfg `json:"catalogs"`
 }
 
-// CatalogCfg optionally overrides id and display names of a catalog folder.
+// CatalogCfg optionally overrides id and display names of a catalog folder. Kind is required for a pack folder
+// under "extras" and must be another kind than songs.
 type CatalogCfg struct {
 	ID    string            `json:"id"`
+	Kind  string            `json:"kind"`
 	Names map[string]string `json:"names"`
+}
+
+// itemMeta is the feed-meta.json of an item folder (SPEC 4.4). It is required: an item needs a license.
+type itemMeta struct {
+	ID      string            `json:"id"`
+	Names   map[string]string `json:"names"`
+	License *License          `json:"license"`
 }
 
 // Meta is the optional feed-meta.json next to a song's txt file.
@@ -301,6 +311,98 @@ func (b *builder) entry(dir, rel string, files map[string]bool, txt string, c *c
 	return song, ""
 }
 
+// items collects the items of one pack folder under "extras": every sub-folder is one item.
+func (b *builder) items(dir, rel string) ([]Item, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var items []Item
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		where := filepath.Join(rel, e.Name())
+		it, problem, err := b.item(filepath.Join(dir, e.Name()), e.Name())
+		if err != nil {
+			return nil, err
+		}
+		if problem != "" {
+			b.skip("%s: %s", where, problem)
+			continue
+		}
+		items = append(items, *it)
+	}
+	return items, nil
+}
+
+func (b *builder) item(dir, folder string) (*Item, string, error) {
+	var meta itemMeta
+	if err := readJSON(filepath.Join(dir, metaName), &meta); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Sprintf(`needs a %s with "license" (items must declare one)`, metaName), nil
+		}
+		return nil, err.Error(), nil
+	}
+	l := meta.License
+	if l == nil || l.SPDX == "" || l.SPDX == "NOLICENSE" {
+		return nil, fmt.Sprintf(`%s needs "license" with "spdx" (NOLICENSE is not allowed for items)`, metaName), nil
+	}
+	lic := *l
+	if lic.URL == "" {
+		lic.URL = ccURL(lic.SPDX)
+	}
+	if lic.URL == "" {
+		return nil, fmt.Sprintf(`%s: license %s needs a "url" (only Creative Commons ids get one automatically)`, metaName, lic.SPDX), nil
+	}
+	it := Item{ID: meta.ID, Names: map[string]string{"en": folder}}
+	if it.ID == "" {
+		it.ID = slug(folder)
+	}
+	for k, v := range meta.Names {
+		it.Names[k] = v
+	}
+	var blobs = map[string]string{}
+	var sizes = map[string]int64{}
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p != dir && strings.HasPrefix(d.Name(), ".") { // .DS_Store, editor files: never part of an item
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, p)
+		rel = filepath.ToSlash(rel)
+		if rel == metaName {
+			return nil
+		}
+		sum, size, err := hashFile(p)
+		if err != nil {
+			return err
+		}
+		blobs[sum], sizes[sum] = p, size
+		it.Files = append(it.Files, ItemFile{Path: rel, SHA256: "sha256:" + sum, Size: size, License: &lic})
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	sort.Slice(it.Files, func(i, j int) bool { return it.Files[i].Path < it.Files[j].Path })
+	if p := itemProblem(it, nil); p != "" {
+		return nil, p, nil
+	}
+	for sum, src := range blobs {
+		b.blobs[sum], b.sizes[sum] = src, sizes[sum]
+	}
+	return &it, "", nil
+}
+
 // previous is what the last build left in the output folder.
 type previous struct {
 	feed     *Feed
@@ -335,6 +437,12 @@ func loadPrevious(out string) (*previous, error) {
 		cat, err := decodeCatalog(ref, stored)
 		if err != nil {
 			continue
+		}
+		for _, it := range cat.Items {
+			p.songs[it.ID] = string(marshal(it, false))
+			for _, f := range it.Files {
+				p.files[it.ID] = append(p.files[it.ID], strings.TrimPrefix(f.SHA256, "sha256:"))
+			}
 		}
 		for _, s := range cat.Songs {
 			p.songs[s.ID] = string(marshal(s, false))
@@ -539,6 +647,7 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 	type cat struct {
 		ref   CatalogRef
 		songs []Song
+		items []Item
 		moved map[string]string
 	}
 	var cats []cat
@@ -553,6 +662,9 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 		cc := cfg.Catalogs[e.Name()]
 		if cc.ID == "" {
 			cc.ID = slug(e.Name())
+		}
+		if cc.Kind != "" && cc.Kind != KindSongs {
+			return fmt.Errorf(`catalog folder %q is in the songs folder, but %s gives it the kind %q: packs of other kinds go into the "extras" folder`, e.Name(), configName, cc.Kind)
 		}
 		if !idRe.MatchString(cc.ID) {
 			return fmt.Errorf(`catalog folder %q needs an id: add "catalogs": {%q: {"id": "..."}} to %s`, e.Name(), e.Name(), configName)
@@ -584,10 +696,59 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 				delete(moved, old)
 			}
 		}
-		cats = append(cats, cat{ref: CatalogRef{ID: cc.ID, Names: names}, songs: kept, moved: moved})
+		cats = append(cats, cat{ref: CatalogRef{ID: cc.ID, Kind: KindSongs, Names: names}, songs: kept, moved: moved})
 	}
 	if len(cats) == 0 {
 		return fmt.Errorf("no songs found in %s (expected <songs>/<catalog folder>/<song folder>/<song>.txt)", songsDir)
+	}
+	// 1b. packs of other kinds (SPEC 4.4): every folder in "extras" is one pack, every folder in it one item
+	if cfg.Extras != "" {
+		extrasDir := resolve(cfg.Extras, "")
+		packs, err := os.ReadDir(extrasDir)
+		if err != nil {
+			return fmt.Errorf("extras folder: %v", err)
+		}
+		for _, e := range packs {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			cc, ok := cfg.Catalogs[e.Name()]
+			if !ok || cc.Kind == "" || cc.Kind == KindSongs || !kindRe.MatchString(cc.Kind) {
+				return fmt.Errorf(`pack folder %q in extras needs a kind: add "catalogs": {%q: {"kind": "theme"}} (or another kind name: a-z, 0-9, "-") to %s`, e.Name(), e.Name(), configName)
+			}
+			if cc.ID == "" {
+				cc.ID = slug(e.Name())
+			}
+			if !idRe.MatchString(cc.ID) {
+				return fmt.Errorf(`pack folder %q needs an id: add "id" to its entry in "catalogs" of %s`, e.Name(), configName)
+			}
+			if slices.ContainsFunc(cats, func(c cat) bool { return c.ref.ID == cc.ID }) {
+				return fmt.Errorf(`pack folder %q: the catalog id %q is used twice; set another "id" in %s`, e.Name(), cc.ID, configName)
+			}
+			names := map[string]string{"en": e.Name()}
+			for k, v := range cc.Names {
+				names[k] = v
+			}
+			items, err := b.items(filepath.Join(extrasDir, e.Name()), e.Name())
+			if err != nil {
+				return err
+			}
+			kept := items[:0]
+			for _, it := range items {
+				if other, dup := owner[it.ID]; dup {
+					b.skip(`%s / %s: the id %q is already used (catalog %s). Set another "id" in its %s`, e.Name(), it.ID, it.ID, other, metaName)
+					continue
+				}
+				owner[it.ID] = cc.ID
+				kept = append(kept, it)
+			}
+			if len(kept) == 0 {
+				b.warn("pack folder %q has no publishable items; left out", e.Name())
+				continue
+			}
+			sort.Slice(kept, func(i, j int) bool { return kept[i].ID < kept[j].ID })
+			cats = append(cats, cat{ref: CatalogRef{ID: cc.ID, Kind: cc.Kind, Names: names}, items: kept})
+		}
 	}
 	for _, id := range removed {
 		if _, live := owner[id]; live {
@@ -600,6 +761,9 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 	current := map[string]string{}
 	audioNow := map[string]string{}
 	for _, c := range cats {
+		for _, it := range c.items {
+			current[it.ID] = string(marshal(it, false))
+		}
 		for _, s := range c.songs {
 			current[s.ID] = string(marshal(s, false))
 			for _, f := range s.Files {
@@ -646,6 +810,17 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 		}
 	}
 
+	nItems := 0
+	for _, c := range cats {
+		nItems += len(c.items)
+	}
+	entries := func() string { // "46 songs", or "46 songs and 1 items"
+		s := fmt.Sprintf("%d songs", len(current)-nItems)
+		if nItems > 0 {
+			s += fmt.Sprintf(" and %d items", nItems)
+		}
+		return s
+	}
 	catSongs := func() [][]Song {
 		all := [][]Song{}
 		for _, c := range cats {
@@ -660,18 +835,27 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 		Keys: cfg.Keys, Mirrors: cfg.Mirrors, MovedTo: cfg.MovedTo, Removed: removed}
 	stored := map[string][]byte{}
 	for _, c := range cats {
-		data := gzipBytes(marshal(Catalog{Spec: Spec, ID: c.ref.ID, Songs: c.songs, Moved: c.moved}, false))
+		data := gzipBytes(marshal(Catalog{Spec: Spec, ID: c.ref.ID, Kind: c.ref.Kind, Songs: c.songs, Items: c.items, Moved: c.moved}, false))
 		sum := hashBytes(data)
 		seen := map[string]bool{}
-		for _, s := range c.songs {
-			for _, f := range s.Files {
-				if !seen[f.SHA256] {
-					seen[f.SHA256] = true
-					c.ref.Bytes += f.Size
-				}
+		count := func(sha string, size int64) {
+			if !seen[sha] {
+				seen[sha] = true
+				c.ref.Bytes += size
 			}
 		}
-		c.ref.Path, c.ref.SHA256, c.ref.Size, c.ref.Songs = "catalog/"+sum+".json.gz", "sha256:"+sum, int64(len(data)), len(c.songs)
+		for _, s := range c.songs {
+			for _, f := range s.Files {
+				count(f.SHA256, f.Size)
+			}
+		}
+		for _, it := range c.items {
+			for _, f := range it.Files {
+				count(f.SHA256, f.Size)
+			}
+		}
+		c.ref.Path, c.ref.SHA256, c.ref.Size = "catalog/"+sum+".json.gz", "sha256:"+sum, int64(len(data))
+		c.ref.Songs, c.ref.Items = len(c.songs), len(c.items)
 		stored[c.ref.Path] = data
 		feed.Catalogs = append(feed.Catalogs, c.ref)
 	}
@@ -691,7 +875,7 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 					return err
 				}
 			}
-			fmt.Fprintf(w, "No changes since the last build (%d songs, sequence %d). No new feed.json written.\n", len(current), feed.Sequence)
+			fmt.Fprintf(w, "No changes since the last build (%s, sequence %d). No new feed.json written.\n", entries(), feed.Sequence)
 			if !dry {
 				// The catalog and signature of the build before the last one were kept for one more build. That
 				// build is this one, so they go now: a withdrawn song must not stay listed in an old catalog.
@@ -776,10 +960,14 @@ func build(dir, out, keyFile string, dry, mass, copyOnly bool, w io.Writer) erro
 	}
 	fmt.Fprintf(w, "%s feed %q → %s\n  sequence %d, %s\n", verb, cfg.Name, out, feed.Sequence, signed)
 	for _, c := range feed.Catalogs {
+		if c.Kind != KindSongs {
+			fmt.Fprintf(w, "  catalog %-24s %5d items %8.1f MB (kind %s)\n", c.ID, c.Items, float64(c.Bytes)/1e6, c.Kind)
+			continue
+		}
 		fmt.Fprintf(w, "  catalog %-24s %5d songs %8.1f MB\n", c.ID, c.Songs, float64(c.Bytes)/1e6)
 	}
 	if prev == nil {
-		fmt.Fprintf(w, "First build: %d songs.\n", len(current))
+		fmt.Fprintf(w, "First build: %s.\n", entries())
 	} else {
 		fmt.Fprintln(w, "Changes since the last build:")
 		for _, l := range []struct {

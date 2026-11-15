@@ -1,7 +1,10 @@
 package kfeed
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"io/fs"
@@ -9,7 +12,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -303,5 +308,246 @@ func TestAPIRemoveAllPacks(t *testing.T) {
 	info, err := Inspect(ctx, Options{Library: lib})
 	if err != nil || !info.Subscribed || slices.ContainsFunc(info.Packs, func(p Pack) bool { return p.Chosen }) {
 		t.Fatalf("after removing all: %+v %v", info, err)
+	}
+}
+
+func TestSignVerify(t *testing.T) {
+	dir := t.TempDir()
+	k1, k2 := filepath.Join(dir, "a.key"), filepath.Join(dir, "b.key")
+	p1, p2 := newKey(t, k1), newKey(t, k2)
+	msg := []byte(`{"app":1}`)
+	sig, pub, err := Sign(k1, msg)
+	if err != nil || pub != p1 {
+		t.Fatalf("Sign: %q, %v (want key %q)", pub, err, p1)
+	}
+	if !Verify([]string{p1}, msg, sig) || !Verify([]string{p2, p1}, msg, sig+"\n") {
+		t.Fatal("good signature refused")
+	}
+	if Verify([]string{p2}, msg, sig) {
+		t.Fatal("signature accepted with the wrong key")
+	}
+	if Verify([]string{p1}, []byte(`{"app":2}`), sig) {
+		t.Fatal("signature accepted for a changed message")
+	}
+	if Verify([]string{p1}, msg, "") || Verify(nil, msg, sig) {
+		t.Fatal("empty signature or no key accepted")
+	}
+	if _, _, err := Sign(filepath.Join(dir, "missing.key"), msg); err == nil {
+		t.Fatal("Sign with a missing key file")
+	}
+}
+
+func TestFetch(t *testing.T) {
+	retryBase = 10 * time.Millisecond
+	data := make([]byte, 300<<10)
+	for i := range data {
+		data[i] = byte(i*7 + i>>9)
+	}
+	sum := sha256.Sum256(data)
+	hexsum := hex.EncodeToString(sum[:])
+	var cut, stall atomic.Bool
+	var served atomic.Int64
+	var ranges []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/files/app.zip" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+		if cut.Load() || stall.Load() {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(200)
+			w.Write(data[:len(data)/2])
+			served.Add(int64(len(data) / 2))
+			w.(http.Flusher).Flush()
+			if stall.Load() {
+				<-r.Context().Done()
+			}
+			cut.Store(false) // the next request gets the file
+			return
+		}
+		cw := &countingResponse{ResponseWriter: w, n: &served}
+		http.ServeContent(cw, r, "app.zip", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+	url := srv.URL + "/files/app.zip"
+	dir := t.TempDir()
+	ctx := context.Background()
+	reset := func() {
+		served.Store(0)
+		mu.Lock()
+		ranges = nil
+		mu.Unlock()
+		os.Remove(filepath.Join(dir, "app.zip"))
+	}
+	assertFile := func(name string) {
+		t.Helper()
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("%s: wrong content (%v)", name, err)
+		}
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), partPrefix) {
+				t.Fatalf("part file left: %s", e.Name())
+			}
+		}
+	}
+
+	t.Run("good", func(t *testing.T) {
+		reset()
+		var last [2]int64
+		calls := 0
+		err := Fetch(ctx, url, "sha256:"+hexsum, int64(len(data)), filepath.Join(dir, "app.zip"), func(d, total int64) { calls++; last = [2]int64{d, total} })
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertFile("app.zip")
+		if calls < 2 || last != [2]int64{int64(len(data)), int64(len(data))} {
+			t.Fatalf("progress: %d calls, last %v", calls, last)
+		}
+		if err := Fetch(ctx, url, hexsum, int64(len(data)), filepath.Join(dir, "plain.zip"), nil); err != nil {
+			t.Fatal("hash without prefix, no progress:", err)
+		}
+		assertFile("plain.zip")
+	})
+	t.Run("wrong hash", func(t *testing.T) {
+		reset()
+		bad := strings.Repeat("0", 64)
+		if err := Fetch(ctx, url, bad, int64(len(data)), filepath.Join(dir, "app.zip"), nil); err == nil || !strings.Contains(err.Error(), "hash") {
+			t.Fatalf("wrong hash: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "app.zip")); err == nil {
+			t.Fatal("file written despite the wrong hash")
+		}
+		for _, h := range []string{"", "sha256:xyz", "../../etc/passwd", strings.ToUpper(hexsum)} {
+			if err := Fetch(ctx, url, h, int64(len(data)), filepath.Join(dir, "app.zip"), nil); err == nil {
+				t.Fatalf("hash %q accepted", h)
+			}
+		}
+	})
+	t.Run("wrong size", func(t *testing.T) {
+		reset()
+		if err := Fetch(ctx, url, hexsum, int64(len(data))-1, filepath.Join(dir, "app.zip"), nil); err == nil || !strings.Contains(err.Error(), "larger") {
+			t.Fatalf("smaller size: %v", err)
+		}
+		if err := Fetch(ctx, url, hexsum, int64(len(data))+1, filepath.Join(dir, "app.zip"), nil); err == nil || !strings.Contains(err.Error(), "ended early") {
+			t.Fatalf("larger size: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "app.zip")); err == nil {
+			t.Fatal("file written despite the wrong size")
+		}
+		os.Remove(partPath(filepath.Join(dir, "app.zip"), hexsum)) // the "ended early" attempts keep their part
+	})
+	t.Run("missing", func(t *testing.T) {
+		reset()
+		if err := Fetch(ctx, srv.URL+"/files/other.zip", hexsum, int64(len(data)), filepath.Join(dir, "app.zip"), nil); err == nil {
+			t.Fatal("missing file: no error")
+		}
+		if err := Fetch(ctx, srv.URL+"/files/", hexsum, int64(len(data)), filepath.Join(dir, "app.zip"), nil); err == nil {
+			t.Fatal("address without a file name: no error")
+		}
+	})
+	t.Run("query and local paths", func(t *testing.T) {
+		reset()
+		if err := Fetch(ctx, url+"?token=a/b", hexsum, int64(len(data)), filepath.Join(dir, "q.zip"), nil); err != nil {
+			t.Fatal("address with a query:", err)
+		}
+		src := filepath.Join(t.TempDir(), "local app.zip")
+		os.WriteFile(src, data, 0o644)
+		if err := Fetch(ctx, src, hexsum, int64(len(data)), filepath.Join(dir, "path.zip"), nil); err != nil {
+			t.Fatal("local path:", err)
+		}
+		if err := Fetch(ctx, "file://"+filepath.ToSlash(src), hexsum, int64(len(data)), filepath.Join(dir, "fileurl.zip"), nil); err != nil && runtime.GOOS != "windows" {
+			t.Fatal("file:// URL:", err)
+		}
+	})
+	t.Run("resume", func(t *testing.T) {
+		reset()
+		cut.Store(true)
+		if err := Fetch(ctx, url, hexsum, int64(len(data)), filepath.Join(dir, "app.zip"), nil); err != nil {
+			t.Fatal(err)
+		}
+		assertFile("app.zip")
+		mu.Lock()
+		got := slices.Clone(ranges)
+		mu.Unlock()
+		want := []string{"", "bytes=" + strconv.Itoa(len(data)/2) + "-"}
+		if !slices.Equal(got, want) || served.Load() != int64(len(data)) {
+			t.Fatalf("requests %q (want %q), %d bytes served (want %d)", got, want, served.Load(), len(data))
+		}
+	})
+	t.Run("cancel", func(t *testing.T) {
+		reset()
+		stall.Store(true)
+		defer stall.Store(false)
+		cctx, cancel := context.WithCancel(ctx)
+		time.AfterFunc(300*time.Millisecond, cancel)
+		start := time.Now()
+		err := Fetch(cctx, url, hexsum, int64(len(data)), filepath.Join(dir, "app.zip"), nil)
+		if !errors.Is(err, context.Canceled) || time.Since(start) > 3*time.Second {
+			t.Fatalf("cancelled Fetch: %v after %v", err, time.Since(start))
+		}
+		fi, err := os.Stat(partPath(filepath.Join(dir, "app.zip"), hexsum))
+		if err != nil || fi.Size() != int64(len(data)/2) {
+			t.Fatalf("part file after cancel: %v, %v", fi, err)
+		}
+		stall.Store(false)
+		served.Store(0)
+		if err := Fetch(ctx, url, hexsum, int64(len(data)), filepath.Join(dir, "app.zip"), nil); err != nil {
+			t.Fatal(err)
+		}
+		assertFile("app.zip")
+		if served.Load() != int64(len(data)-len(data)/2) {
+			t.Fatalf("after cancel %d bytes served, want only the rest", served.Load())
+		}
+	})
+	t.Run("local", func(t *testing.T) {
+		src := t.TempDir()
+		os.WriteFile(filepath.Join(src, "app.zip"), data, 0o644)
+		if err := Fetch(ctx, filepath.ToSlash(src)+"/app.zip", hexsum, int64(len(data)), filepath.Join(dir, "local.zip"), nil); err != nil {
+			t.Fatal(err)
+		}
+		assertFile("local.zip")
+	})
+}
+
+// countingResponse counts the body bytes written.
+type countingResponse struct {
+	http.ResponseWriter
+	n *atomic.Int64
+}
+
+func (c *countingResponse) Write(b []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(b)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+func TestSplitAddress(t *testing.T) {
+	sep := string(filepath.Separator)
+	for _, c := range []struct{ in, dir, name string }{
+		{"https://example.org/a/app.zip", "https://example.org/a/", "app.zip"},
+		{"https://example.org/app.zip?t=x/y", "https://example.org/", "app.zip?t=x/y"},
+		{"http://example.org/dl/app.zip#frag", "http://example.org/dl/", "app.zip#frag"},
+		{"https://example.org", "", ""},
+		{"https://example.org/", "", ""},
+		{"https://example.org/a/?file=app.zip", "", ""},
+		{filepath.Join("games", "app.zip"), "games", "app.zip"},
+		{"file:///games/app.zip", filepath.FromSlash("/games"), "app.zip"},
+		{"games" + sep, "", ""},
+	} {
+		dir, name, ok := splitAddress(c.in)
+		if dir != c.dir || name != c.name || ok != (c.name != "") {
+			t.Errorf("splitAddress(%q) = %q, %q, %v; want %q, %q", c.in, dir, name, ok, c.dir, c.name)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if dir, name, ok := splitAddress(`C:\games\app.zip`); !ok || dir != `C:\games` || name != "app.zip" {
+			t.Errorf("Windows path: %q %q %v", dir, name, ok)
+		}
 	}
 }

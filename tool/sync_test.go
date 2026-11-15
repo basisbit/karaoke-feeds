@@ -355,12 +355,12 @@ func TestSyncHostileFeed(t *testing.T) {
 		{ID: "e", Artist: "x", Title: "e", Files: []File{f("txt", "s.txt"), {Role: "audio", Name: "big.mp3", SHA256: "sha256:" + sum, Size: 0, License: lic}}},
 		{ID: "ok", Artist: "x", Title: "ok", Files: []File{f("txt", "s.txt"), f("audio", "a.mp3"), {Role: "future", Name: "../../z"}}},
 	}
-	cat := marshal(Catalog{Spec: Spec, ID: "h", Songs: songs}, false)
+	cat := marshal(Catalog{Spec: Spec, ID: "h", Kind: KindSongs, Songs: songs}, false)
 	cs := hashBytes(cat)
 	os.MkdirAll(filepath.Join(pub, "catalog"), 0o755)
 	os.WriteFile(filepath.Join(pub, "catalog", cs+".json"), cat, 0o644)
 	feed := Feed{Spec: Spec, Name: "hostile", Operator: Operator{Name: "x", Contact: "mailto:x@example.org"}, Sequence: 1, Generated: "2026-11-14T00:00:00Z",
-		Catalogs: []CatalogRef{{ID: "h", Path: "catalog/" + cs + ".json", SHA256: "sha256:" + cs, Size: int64(len(cat))}}}
+		Catalogs: []CatalogRef{{ID: "h", Kind: KindSongs, Path: "catalog/" + cs + ".json", SHA256: "sha256:" + cs, Size: int64(len(cat))}}}
 	os.WriteFile(filepath.Join(pub, "feed.json"), marshal(feed, true), 0o644)
 	base := t.TempDir()
 	r := syncRun{t, filepath.Join(base, "lib")}
@@ -430,4 +430,47 @@ func TestResumeWithinSync(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestKeepLocalOnRemoval: files changed here, and files kfeed did not write, survive when their song is removed
+// (SPEC 5.2); an edited txt is hidden instead, so the game no longer lists the song.
+func TestKeepLocalOnRemoval(t *testing.T) {
+	dir := t.TempDir()
+	config(dir)
+	song(dir, "Pop", "P", "p.txt", h("Pop", "Song", "p.mp3"), by, "p.mp3")
+	song(dir, "Rock", "R", "r.txt", h("Rock", "Song", "r.mp3"), by, "r.mp3")
+	song(dir, "Rock", "T", "t.txt", h("Txt", "Edit", "t.mp3"), by, "t.mp3")
+	song(dir, "Rock", "F", "f.txt", h("Foreign", "File", "f.mp3"), by, "f.mp3")
+	rebuild(t, dir, "")
+	pub := filepath.Join(dir, "public")
+	lib := filepath.Join(t.TempDir(), "lib")
+	r := syncRun{t, lib}
+	in := func(parts ...string) string { return filepath.Join(append([]string{lib}, parts...)...) }
+	os.MkdirAll(in("foreign-file"), 0o755)
+	os.WriteFile(in("foreign-file", "f.mp3"), []byte("someone else's"), 0o644)
+
+	r.ok(pub, syncOpts{all: true}, "foreign-file/f.mp3")
+	os.WriteFile(in("rock-song", "r.mp3"), []byte("my mix"), 0o644)
+	os.WriteFile(in("txt-edit", "t.txt"), []byte("#TITLE:my timing fix\n"), 0o644)
+	r.ok("", syncOpts{}, "kept as they are (3)")
+	r.ok("", syncOpts{}, "kept as they are (3)") // still known as changed on the next run
+
+	r.ok("", syncOpts{catalogs: []string{"pop"}}, "removed (catalog or license no longer chosen) (3)")
+	for p, want := range map[string]string{
+		in("rock-song", "r.mp3"):               "my mix",
+		in("txt-edit", "t.txt") + hiddenSuffix: "#TITLE:my timing fix\n",
+		in("foreign-file", "f.mp3"):            "someone else's",
+	} {
+		if data, err := os.ReadFile(p); err != nil || string(data) != want {
+			t.Errorf("%s: %q %v, want %q", p, data, err, want)
+		}
+	}
+	for _, p := range []string{in("rock-song", "r.txt"), in("txt-edit", "t.txt"), in("txt-edit", "t.mp3"), in("foreign-file", "f.txt")} {
+		if exists(p) {
+			t.Errorf("%s: should be deleted (unchanged, written by kfeed) or hidden", p)
+		}
+	}
+	if !exists(in("pop-song", "p.mp3")) {
+		t.Error("the chosen pack lost a song")
+	}
 }
