@@ -1,4 +1,4 @@
-package main
+package kfeed
 
 import (
 	"net/http"

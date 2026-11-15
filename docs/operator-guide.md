@@ -32,7 +32,7 @@ There are no downloads yet. Build it from this repository with Go 1.22 or newer:
 
 ```
 cd tool
-go build -o kfeed .
+go build -o kfeed ./cmd/kfeed
 ```
 
 The result is one file, `kfeed` (`kfeed.exe` on Windows), without further dependencies. Copy it wherever you like.

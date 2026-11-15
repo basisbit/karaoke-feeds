@@ -1,15 +1,17 @@
-package main
+package kfeed
 
 // kfeed sync: the player side. Keeps a library folder in step with a feed (SPEC section 5).
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -62,6 +65,16 @@ type syncOpts struct {
 	key               string
 	replaceLocal      bool
 	jobs              int
+	ctx               context.Context // nil: not cancellable (command line)
+	progress          *tracker        // nil: no progress reports (command line)
+	seeds             []string        // folders with songs the player has already (seed.go)
+}
+
+func (o syncOpts) context() context.Context {
+	if o.ctx == nil {
+		return context.Background()
+	}
+	return o.ctx
 }
 
 type syncReport struct {
@@ -72,6 +85,7 @@ type syncReport struct {
 	excluded                                             []string
 	failed                                               []string
 	downloaded                                           int64
+	imported                                             int64 // bytes taken from seed folders
 	retried                                              int
 }
 
@@ -188,29 +202,51 @@ func writeAtomic(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
+// syncPass holds what the first steps of a sync found out. syncLibrary and the API (api.go) share these steps.
+type syncPass struct {
+	o          syncOpts
+	sdir       string
+	st         *syncState
+	rep        *syncReport
+	feed       *Feed
+	signed     bool
+	locs       []source
+	selected   func(id string) bool
+	wanted     map[string]Song
+	songCat    map[string]string
+	byChoice   map[string]bool // not synced because of the player's license choice
+	failedCats map[string]bool
+	moved      map[string]string
+}
+
+// openRun locks the library and loads its state. The caller must call unlock when done.
+func openRun(o syncOpts) (r *syncPass, unlock func(), err error) {
 	sdir := filepath.Join(o.lib, stateDirName)
 	// The state is private: it holds the feed address, which can contain an access token (SPEC 5.5).
 	if err := os.MkdirAll(filepath.Join(sdir, "catalogs"), 0o700); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	os.Chmod(sdir, 0o700) // also for libraries made by older versions
 	lock := filepath.Join(sdir, "lock")
 	lf, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("another sync of %s is running (or one crashed: then delete %s)", o.lib, lock)
+		return nil, nil, fmt.Errorf("another sync of %s is running (or one crashed: then delete %s)", o.lib, lock)
 	}
 	fmt.Fprintf(lf, "%d\n", os.Getpid())
 	lf.Close()
-	defer os.Remove(lock)
+	unlock = func() { os.Remove(lock) }
 
 	st, err := loadState(sdir)
 	if err != nil {
-		return nil, err
+		unlock()
+		return nil, nil, err
 	}
-	rep := &syncReport{}
+	return &syncPass{o: o, sdir: sdir, st: st, rep: &syncReport{}}, unlock, nil
+}
 
-	// 1. where the feed is, and which keys it must be signed with
+// fetchFeed finds out where the feed is and which keys it must be signed with, and gets its feed.json.
+func (r *syncPass) fetchFeed() error {
+	st, o := r.st, &r.o
 	given, fragKey, _ := strings.Cut(o.feed, "#ed25519=")
 	if fragKey != "" && o.key == "" {
 		o.key = "ed25519:" + fragKey
@@ -218,13 +254,13 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 	if o.key != "" {
 		var err error
 		if o.key, err = publicKeyArg(o.key); err != nil {
-			return nil, err
+			return err
 		}
 		if len(st.Trust) > 0 && !slices.Contains(st.Trust, o.key) {
-			return nil, fmt.Errorf("the key %s is not one of this subscription's keys %v", o.key, st.Trust)
+			return fmt.Errorf("the key %s is not one of this subscription's keys %v", o.key, st.Trust)
 		}
 		if len(st.Trust) == 0 && st.Sequence > 0 {
-			return nil, errors.New("this library was subscribed to an unsigned feed; to add a key, subscribe again in a new folder")
+			return errors.New("this library was subscribed to an unsigned feed; to add a key, subscribe again in a new folder")
 		}
 		if len(st.Trust) == 0 {
 			st.Trust = []string{o.key}
@@ -232,24 +268,29 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 	}
 	given = strings.TrimSuffix(given, "feed.json")
 	if given == "" && len(st.Locations) == 0 {
-		return nil, errors.New("the first sync of a library needs the feed address")
+		return errors.New("the first sync of a library needs the feed address")
 	}
 	newLocation := given != "" && !slices.Contains(st.Locations, given)
 	if newLocation && len(st.Locations) > 0 && len(st.Trust) == 0 {
-		return nil, fmt.Errorf("this feed is unsigned, so it can only be synced from %s (SPEC 6.3)", showLoc(st.Locations[0]))
+		return fmt.Errorf("this feed is unsigned, so it can only be synced from %s (SPEC 6.3)", showLoc(st.Locations[0]))
 	}
 
-	// 2. feed.json
-	feed, _, signed, err := acceptFeed(st, given, newLocation, sdir, rep)
+	feed, _, signed, err := acceptFeed(o.ctx, st, given, newLocation, r.sdir, r.rep)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	locs := []source{}
+	r.feed, r.signed = feed, signed
 	for _, l := range append(slices.Clone(st.Locations), feed.Mirrors...) {
-		locs = append(locs, newSource(l))
+		src := newSource(l)
+		src.ctx = o.ctx
+		r.locs = append(r.locs, src)
 	}
+	return nil
+}
 
-	// 3. which catalogs
+// choose applies the catalog and license choice of the options. Without any choice it lists the catalogs on w.
+func (r *syncPass) choose(w io.Writer) error {
+	st, o, feed := r.st, r.o, r.feed
 	ids := []string{}
 	for _, c := range feed.Catalogs {
 		ids = append(ids, c.ID)
@@ -260,7 +301,7 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 	case o.catalogs != nil:
 		for _, c := range o.catalogs {
 			if !slices.Contains(ids, c) {
-				return nil, fmt.Errorf("the feed has no catalog %q (it has: %s)", c, strings.Join(ids, ", "))
+				return fmt.Errorf("the feed has no catalog %q (it has: %s)", c, strings.Join(ids, ", "))
 			}
 		}
 		st.Catalogs = o.catalogs
@@ -271,7 +312,7 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 	if o.exclude != nil {
 		for _, p := range *o.exclude {
 			if p != "nc" && p != "nd" && p != "sa" {
-				return nil, fmt.Errorf("--exclude knows nc (NonCommercial), nd (NoDerivatives) and sa (ShareAlike), not %q", p)
+				return fmt.Errorf("--exclude knows nc (NonCommercial), nd (NoDerivatives) and sa (ShareAlike), not %q", p)
 			}
 		}
 		st.Exclude = *o.exclude
@@ -282,25 +323,30 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 			fmt.Fprintf(w, "  %-24s %-30s %5d songs %9.1f MB\n", c.ID, c.Names["en"], c.Songs, float64(c.Bytes)/1e6)
 		}
 		fmt.Fprintln(w, "Choose with --catalog <id> (repeatable) or --all, then run again.")
-		return nil, errChooseCatalogs
+		return errChooseCatalogs
 	}
-	selected := func(id string) bool { return slices.Contains(st.Catalogs, "*") || slices.Contains(st.Catalogs, id) }
+	r.selected = func(id string) bool { return slices.Contains(st.Catalogs, "*") || slices.Contains(st.Catalogs, id) }
+	return nil
+}
 
-	// 4. catalogs: from the local cache or downloaded, always verified
+// loadCatalogs gets the selected catalogs, from the local cache or downloaded, always verified, and decides which
+// songs are wanted.
+func (r *syncPass) loadCatalogs() {
+	st, rep, sdir := r.st, r.rep, r.sdir
 	wanted := map[string]Song{}
 	songCat := map[string]string{}
 	filtered := map[string]bool{} // in a selected catalog, but not synced (unsafe, or the player's license choice)
-	byChoice := map[string]bool{} // not synced because of the player's license choice
+	byChoice := map[string]bool{}
 	failedCats := map[string]bool{}
 	moved := map[string]string{}
 	keepCache := map[string]bool{}
-	for _, ref := range feed.Catalogs {
-		if !selected(ref.ID) {
+	for _, ref := range r.feed.Catalogs {
+		if !r.selected(ref.ID) {
 			continue
 		}
 		name := filepath.Base(ref.Path)
 		keepCache[name] = true
-		cat, err := loadCatalog(locs, ref, filepath.Join(sdir, "catalogs", name))
+		cat, err := loadCatalog(r.locs, ref, filepath.Join(sdir, "catalogs", name))
 		if err != nil {
 			failedCats[ref.ID] = true
 			rep.add(&rep.failed, fmt.Sprintf("catalog %s: %v", ref.ID, err))
@@ -338,6 +384,27 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 			}
 		}
 	}
+	r.wanted, r.songCat, r.byChoice, r.failedCats, r.moved = wanted, songCat, byChoice, failedCats, moved
+}
+
+func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
+	// 1. and 2. where the feed is, its keys, feed.json
+	r, unlock, err := openRun(o)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := r.fetchFeed(); err != nil {
+		return nil, err
+	}
+	// 3. which catalogs
+	if err := r.choose(w); err != nil {
+		return nil, err
+	}
+	// 4. catalogs
+	r.loadCatalogs()
+	o, st, rep, feed, signed, locs, selected := r.o, r.st, r.rep, r.feed, r.signed, r.locs, r.selected
+	wanted, songCat, byChoice, failedCats, moved := r.wanted, r.songCat, r.byChoice, r.failedCats, r.moved
 
 	// 5. renames, withdrawals, songs that are no longer offered
 	for old, nu := range moved {
@@ -395,22 +462,27 @@ func syncLibrary(o syncOpts, w io.Writer) (*syncReport, error) {
 			plans = append(plans, p)
 		}
 	}
-	runDownloads(o, locs, plans, known, rep, false) // media first
-	runDownloads(o, locs, plans, known, rep, true)  // then the txt, so a song only appears when it is complete
+	o.progress.start(plans)
+	stop := o.progress.every(500 * time.Millisecond)
+	seeds := indexSeeds(o.context(), o.seeds, o.lib)
+	runDownloads(o, locs, plans, known, seeds, rep, false) // media first
+	runDownloads(o, locs, plans, known, seeds, rep, true)  // then the txt, so a song only appears when it is complete
+	stop()
+	o.progress.finishing()
 	for _, p := range plans {
 		finishSong(o, st, p, rep)
 	}
 
 	// 7. save
 	data, _ := json.MarshalIndent(st, "", " ")
-	if err := writeAtomic(filepath.Join(sdir, "state.json"), data); err != nil {
+	if err := writeAtomic(filepath.Join(r.sdir, "state.json"), data); err != nil {
 		return rep, err
 	}
 	return rep, nil
 }
 
 // acceptFeed applies SPEC 5.1 and 6. It returns the feed.json to use: a newly accepted one or the cached one.
-func acceptFeed(st *syncState, given string, newLocation bool, sdir string, rep *syncReport) (*Feed, []byte, bool, error) {
+func acceptFeed(ctx context.Context, st *syncState, given string, newLocation bool, sdir string, rep *syncReport) (*Feed, []byte, bool, error) {
 	cached := filepath.Join(sdir, "feed.json")
 	try := slices.Clone(st.Locations)
 	if given != "" {
@@ -419,7 +491,9 @@ func acceptFeed(st *syncState, given string, newLocation bool, sdir string, rep 
 	var notes []string
 	for hop := 0; hop < 2; hop++ { // the second round follows moved_to once
 		for _, loc := range try {
-			raw, _, err := newSource(loc).get("feed.json", maxFeedSize)
+			src := newSource(loc)
+			src.ctx = ctx
+			raw, _, err := src.get("feed.json", maxFeedSize)
 			if err != nil {
 				notes = append(notes, fmt.Sprintf("%s: %v", showLoc(loc), accessNote(err)))
 				continue
@@ -434,7 +508,7 @@ func acceptFeed(st *syncState, given string, newLocation bool, sdir string, rep 
 				trust = f.Keys // trust on first use
 			}
 			if len(trust) > 0 {
-				sig, _, err := newSource(loc).get("sig/"+hashBytes(raw)+".sig", 1024)
+				sig, _, err := src.get("sig/"+hashBytes(raw)+".sig", 1024)
 				if err != nil || len(f.Keys) == 0 || len(f.Keys) > 8 || !sigValid(trust, raw, string(sig)) {
 					notes = append(notes, fmt.Sprintf("%s: signature missing or not valid for this subscription's keys", showLoc(loc)))
 					continue
@@ -607,6 +681,7 @@ type fileJob struct {
 	size            int64
 	txt             bool
 	done            bool
+	plan            *songPlan
 }
 
 type songPlan struct {
@@ -616,6 +691,22 @@ type songPlan struct {
 	jobs                []*fileJob
 	keep                map[string]fileRec // files that are fine as they are, or kept local versions
 	failed              bool
+	left                int // jobs not processed yet; guarded by the tracker
+}
+
+// fileAction decides what a sync does with one file of a wanted song: keep the local file (keep is its record, and
+// local is true for a version changed here, SPEC 5.2) or download it.
+func fileAction(o syncOpts, path string, f File, rec *songRec) (keep fileRec, local, download bool) {
+	want := strings.TrimPrefix(f.SHA256, "sha256:")
+	old, hasRec := rec.Files[f.Name]
+	have, exists := localHash(path, old, hasRec)
+	switch {
+	case exists && have == want:
+		return record(path, want), false, false
+	case exists && !o.replaceLocal && (!hasRec || have != old.SHA256):
+		return record(path, have), true, false // changed here, or not ours: never overwrite without asking
+	}
+	return fileRec{}, false, true
 }
 
 func planSong(o syncOpts, st *syncState, id string, s Song, catalog string, rep *syncReport) *songPlan {
@@ -644,24 +735,22 @@ func planSong(o syncOpts, st *syncState, id string, s Song, catalog string, rep 
 		if _, known := roleExt[f.Role]; !known {
 			continue
 		}
-		want := strings.TrimPrefix(f.SHA256, "sha256:")
 		path := filepath.Join(folder, f.Name)
-		old, hasRec := rec.Files[f.Name]
-		have, exists := localHash(path, old, hasRec)
-		switch {
-		case exists && have == want:
-			p.keep[f.Name] = record(path, want)
-		case exists && !o.replaceLocal && (!hasRec || have != old.SHA256):
-			p.keep[f.Name] = record(path, have) // changed here, or not ours: never overwrite without asking (SPEC 5.2)
+		keep, local, download := fileAction(o, path, f, rec)
+		if download {
+			want := strings.TrimPrefix(f.SHA256, "sha256:")
+			p.jobs = append(p.jobs, &fileJob{name: f.Name, hex: want, path: path, size: f.Size, txt: f.Role == "txt", plan: p})
+			continue
+		}
+		p.keep[f.Name] = keep
+		if local {
 			rep.add(&rep.keptLocal, id+"/"+f.Name)
-		default:
-			p.jobs = append(p.jobs, &fileJob{name: f.Name, hex: want, path: path, size: f.Size, txt: f.Role == "txt"})
 		}
 	}
 	return p
 }
 
-func runDownloads(o syncOpts, locs []source, plans []*songPlan, known map[string]string, rep *syncReport, txt bool) {
+func runDownloads(o syncOpts, locs []source, plans []*songPlan, known map[string]string, seeds *seedIndex, rep *syncReport, txt bool) {
 	var mu sync.Mutex
 	queue := make(chan *fileJob)
 	var wg sync.WaitGroup
@@ -670,27 +759,47 @@ func runDownloads(o syncOpts, locs []source, plans []*songPlan, known map[string
 		go func() {
 			defer wg.Done()
 			for j := range queue {
+				if o.ctx != nil && o.ctx.Err() != nil {
+					continue // cancelled: the file stays as it is, so the song stays hidden or old (finishSong)
+				}
+				o.progress.working(j.plan.song)
 				mu.Lock()
 				src := known[j.hex]
 				mu.Unlock()
 				err := errors.New("no copy")
 				if src != "" && src != j.path {
-					err = copyVerified(src, j.path, j.hex, j.size)
+					if err = copyVerified(src, j.path, j.hex, j.size); err == nil {
+						o.progress.addBytes(j.size)
+					}
+				}
+				if err != nil {
+					if seed := seeds.find(o.context(), j.hex, j.size); seed != "" {
+						if err = takeSeed(o.context(), seed, j.path, j.hex, j.size, j.txt); err == nil {
+							o.progress.addBytes(j.size)
+							rep.mu.Lock()
+							rep.imported += j.size
+							rep.mu.Unlock()
+						}
+					}
 				}
 				if err != nil {
 					var n int64
 					var retries int
-					n, retries, err = fetchBlob(locs, j.hex, j.size, j.path)
+					n, retries, err = fetchBlob(locs, j.hex, j.size, j.path, o.progress)
 					rep.mu.Lock()
 					rep.downloaded += n
 					rep.retried += retries
 					rep.mu.Unlock()
 				}
 				if err != nil {
-					rep.add(&rep.failed, fmt.Sprintf("%s: %v", j.path, err))
+					if o.ctx == nil || o.ctx.Err() == nil {
+						rep.add(&rep.failed, fmt.Sprintf("%s: %v", j.path, err))
+					}
+					o.progress.processed(j)
 					continue
 				}
 				j.done = true
+				o.progress.processed(j)
 				mu.Lock()
 				known[j.hex] = j.path
 				mu.Unlock()
@@ -717,9 +826,16 @@ func runDownloads(o syncOpts, locs []source, plans []*songPlan, known map[string
 const attempts = 3
 
 // fetchBlob downloads one file into place, trying every location; it is renamed into place only when verified.
-// It returns the bytes transferred and how many attempts had to be repeated.
-func fetchBlob(locs []source, hexsum string, size int64, dest string) (int64, int, error) {
+// It returns the bytes transferred and how many attempts had to be repeated. An interrupted download stays as a part
+// file named after its hash (partPath), so that a later attempt or sync continues it instead of starting again.
+func fetchBlob(locs []source, hexsum string, size int64, dest string, t *tracker) (int64, int, error) {
 	rel := "blobs/" + hexsum[:2] + "/" + hexsum
+	part := partPath(dest, hexsum)
+	if _, busy := activeParts.LoadOrStore(part, true); busy {
+		part = "" // another job downloads the same file into this folder: this one doesn't keep a part file
+	} else {
+		defer activeParts.Delete(part)
+	}
 	var last error = errors.New("no location")
 	var total int64
 	retries := 0
@@ -728,38 +844,109 @@ func fetchBlob(locs []source, hexsum string, size int64, dest string) (int64, in
 			if try > 1 {
 				retries++
 			}
-			r, _, err := s.open(rel)
-			if err != nil {
-				last = err
+			n, next, err := fetchOnce(s, rel, hexsum, size, dest, part, t)
+			total += n
+			if err == nil {
+				return total, retries, nil
+			}
+			last = err
+			if next {
 				break // not there, or refused: next location (open already waits on 429/503)
 			}
-			f, err := os.CreateTemp(filepath.Dir(dest), partPrefix+"*")
-			if err != nil {
-				r.Close()
-				return total, retries, err
-			}
-			tmp := f.Name()
-			h := sha256.New()
-			n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, size+1)) // never more than declared (SPEC 5.1.5)
-			r.Close()
-			cerr := f.Close()
-			total += n
-			switch {
-			case err != nil || cerr != nil:
-				last = fmt.Errorf("%s: download broke off after %d of %d bytes: %v", showLoc(s.base), n, size, errors.Join(err, cerr))
-			case n > size:
-				last = fmt.Errorf("%s: larger than the %d bytes the catalog says", showLoc(s.base), size)
-			case n < size:
-				last = fmt.Errorf("%s: got %d of %d bytes (the download ended early)", showLoc(s.base), n, size)
-			case hex.EncodeToString(h.Sum(nil)) != hexsum:
-				last = fmt.Errorf("%s: content does not match its hash", showLoc(s.base))
-			default:
-				return total, retries, os.Rename(tmp, dest)
-			}
-			os.Remove(tmp)
 		}
 	}
 	return total, retries, fmt.Errorf("%v (after %d attempts per location)", last, attempts)
+}
+
+// partPath is where the download of the file with this hash into dest's folder is kept until it is complete.
+func partPath(dest, hexsum string) string {
+	return filepath.Join(filepath.Dir(dest), partPrefix+hexsum)
+}
+
+// activeParts holds the part files that a job is writing (path -> true).
+var activeParts sync.Map
+
+// fetchOnce makes one download attempt. With part != "" it continues the bytes already in the part file (Range
+// request) and keeps them when the attempt breaks off. next is true when this location can't deliver the file.
+func fetchOnce(s source, rel, hexsum string, size int64, dest, part string, t *tracker) (n int64, next bool, err error) {
+	var f *os.File
+	if part != "" {
+		f, err = os.OpenFile(part, os.O_RDWR|os.O_CREATE, 0o644)
+	} else {
+		f, err = os.CreateTemp(filepath.Dir(dest), partPrefix+"*")
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	tmp := f.Name()
+	h := sha256.New()
+	have, err := io.Copy(h, f) // what an earlier attempt left; the file offset is now at its end
+	if err != nil || have >= size {
+		have, err = 0, restart(f, h)
+		if err != nil {
+			f.Close()
+			return 0, false, err
+		}
+	}
+	r, from, err := s.openFrom(rel, have)
+	if err != nil {
+		f.Close()
+		if part == "" {
+			os.Remove(tmp)
+		}
+		return 0, true, err
+	}
+	if from != have { // the server sent the whole file
+		have = 0
+		if err := restart(f, h); err != nil {
+			r.Close()
+			f.Close()
+			return 0, false, err
+		}
+	}
+	n, err = io.Copy(io.MultiWriter(f, h, t.counter()), io.LimitReader(r, size-have+1)) // never more than declared (SPEC 5.1.5)
+	r.Close()
+	cerr := f.Close()
+	got := have + n
+	keep := false // a part file with a correct beginning is kept for the next attempt
+	switch {
+	case err != nil || cerr != nil:
+		err = fmt.Errorf("%s: download broke off after %d of %d bytes: %v", showLoc(s.base), got, size, errors.Join(err, cerr))
+		keep = true
+	case got > size:
+		err = fmt.Errorf("%s: larger than the %d bytes the catalog says", showLoc(s.base), size)
+	case got < size:
+		err = fmt.Errorf("%s: got %d of %d bytes (the download ended early)", showLoc(s.base), got, size)
+		keep = true
+	case hex.EncodeToString(h.Sum(nil)) != hexsum:
+		err = fmt.Errorf("%s: content does not match its hash", showLoc(s.base))
+	default:
+		return n, false, os.Rename(tmp, dest)
+	}
+	if !keep || part == "" || got == 0 {
+		os.Remove(tmp)
+	}
+	return n, false, err
+}
+
+// restart empties a part file and its running hash.
+func restart(f *os.File, h hash.Hash) error {
+	h.Reset()
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	_, err := f.Seek(0, io.SeekStart)
+	return err
+}
+
+// removeParts deletes the part files in a song folder (after the song is complete, or removed).
+func removeParts(folder string) {
+	entries, _ := os.ReadDir(folder)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), partPrefix) && !e.IsDir() {
+			os.Remove(filepath.Join(folder, e.Name()))
+		}
+	}
 }
 
 func copyVerified(src, dest, hexsum string, size int64) error {
@@ -831,6 +1018,7 @@ func finishSong(o syncOpts, st *syncState, p *songPlan, rep *syncReport) {
 		}
 	}
 	st.Songs[p.id] = &songRec{Catalog: p.catalog, Txt: txt, Files: files}
+	removeParts(p.folder) // left over from files the song no longer has
 	switch {
 	case p.isNew:
 		rep.add(&rep.added, p.id)
@@ -873,7 +1061,8 @@ func removeSong(folder string, rec *songRec, rep *syncReport) {
 			}
 		}
 	}
-	os.Remove(folder) // only succeeds if empty
+	removeParts(folder) // interrupted downloads of this song
+	os.Remove(folder)   // only succeeds if empty
 }
 
 func printReport(w io.Writer, r *syncReport) {

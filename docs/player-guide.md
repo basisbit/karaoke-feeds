@@ -106,5 +106,8 @@ Later updates need only the folder, as usual. `kfeed` keeps the address in the f
 
 - The folder `.kfeed` inside the sync folder holds the state. Deleting it makes `kfeed` forget the subscription; the songs stay, but are then treated as files that aren't its own.
 - Interrupted downloads leave nothing broken: files are checked and only then moved into place, and a song's `.txt` is written last.
+  A file that was cut off halfway is kept as a hidden `.kfeed-part-…` file and continued from where it stopped on the next
+  attempt or the next sync (if the server supports range requests; otherwise it is downloaded again). Leftover part
+  files are deleted once the song is complete or removed.
 - Every file is checked against its checksum before it enters your library. A mismatch is reported and the file is discarded.
 - Not available yet: a size limit for the folder, downloading only on demand while playing, and a graphical interface. These belong into the games themselves; `kfeed sync` is the version that works today without changing any game.

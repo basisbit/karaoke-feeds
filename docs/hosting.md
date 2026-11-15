@@ -24,7 +24,7 @@ Everything except `feed.json` is **immutable**: a file name is the checksum of i
 | Serve the folder at a stable URL over **HTTPS** | `https://feed.example.org/feed.json` is what players subscribe to. Moving it later loses subscribers. |
 | Deliver files **byte for byte** | No minifying, no image optimisation, no rewriting. A changed byte fails the checksum and the game discards the file. |
 | No `Content-Encoding` label on stored files | In particular, don't announce `.json.gz` files as `Content-Encoding: gzip`. Normal on-the-fly compression is fine. |
-| Support **range requests** | Games play song previews by fetching a part of the audio file. All common web servers do this for static files. |
+| Support **range requests** | Games play song previews by fetching a part of the audio file, and clients continue interrupted downloads instead of starting again. All common web servers do this for static files. |
 | Header `Access-Control-Allow-Origin: *` on all files | Needed by games that run in a browser. Harmless for public static files. |
 | `Cache-Control: public, max-age=300, stale-if-error=86400` on `feed.json` | Updates and takedowns reach players within minutes; a CDN may keep serving it for a day if your server fails. |
 | `Cache-Control: public, max-age=31536000, immutable` on `blobs/`, `catalog/`, `sig/` | Lets CDNs and games keep these files without asking again. |

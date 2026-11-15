@@ -3,7 +3,7 @@
 #   distrobox create --name kfeed-webtest --image quay.io/fedora/fedora:45
 #   distrobox enter kfeed-webtest -- sudo dnf install -y nginx caddy httpd mod_ssl mod_qos python3 openssl curl logrotate
 #   distrobox enter kfeed-webtest -- hosting/test/run.sh [nginx] [caddy] [apache]
-# Also needs logrotate in the box (dnf install logrotate). Needs bin/kfeed (cd tool && go build -o ../bin/kfeed .) and the songs checkout next to karaoke-feeds.
+# Also needs logrotate in the box (dnf install logrotate). Needs bin/kfeed (cd tool && go build -o ../bin/kfeed ./cmd/kfeed) and the songs checkout next to karaoke-feeds.
 # The servers run as your user on 127.0.0.1 ports 184xx/180xx; nothing is installed or changed outside $RT.
 set -u
 HOSTING=$(cd "$(dirname "$0")/.." && pwd); REPO=$(dirname "$HOSTING")

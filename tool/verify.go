@@ -1,4 +1,4 @@
-package main
+package kfeed
 
 import (
 	"context"
@@ -22,6 +22,14 @@ type source struct {
 	base   string
 	remote bool
 	client *http.Client
+	ctx    context.Context // nil: context.Background(); cancels requests, downloads and waits
+}
+
+func (s source) context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
 }
 
 // retryBase is the first wait after a 429/503 without Retry-After (SPEC 5.1.8); tests make it shorter.
@@ -89,7 +97,7 @@ func (i *idleReader) Close() error {
 }
 
 func (s source) request(method, rel, rng string) (*http.Response, error) {
-	return s.requestCtx(context.Background(), method, rel, rng)
+	return s.requestCtx(s.context(), method, rel, rng)
 }
 
 func (s source) requestCtx(ctx context.Context, method, rel, rng string) (*http.Response, error) {
@@ -112,31 +120,84 @@ func (s source) requestCtx(ctx context.Context, method, rel, rng string) (*http.
 
 // open starts reading a file. Remote sources wait and retry on 429 and 503 (Retry-After, else 10 s doubling).
 func (s source) open(rel string) (io.ReadCloser, http.Header, error) {
+	r, hdr, _, err := s.openRange(rel, "")
+	return r, hdr, err
+}
+
+// openFrom starts reading a file at offset, to continue an interrupted download. from is where the returned data
+// starts: offset when the server sent the rest (206 with a matching Content-Range), 0 when it sent the whole file
+// (no Range support, or a range it can't serve).
+func (s source) openFrom(rel string, offset int64) (r io.ReadCloser, from int64, err error) {
+	if offset <= 0 {
+		r, _, err = s.open(rel)
+		return r, 0, err
+	}
 	if !s.remote {
+		if err := s.context().Err(); err != nil {
+			return nil, 0, err
+		}
 		f, err := os.Open(filepath.Join(s.base, filepath.FromSlash(rel)))
-		return f, nil, err
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			f.Close()
+			return nil, 0, err
+		}
+		return f, offset, nil
+	}
+	r, hdr, status, err := s.openRange(rel, "bytes="+strconv.FormatInt(offset, 10)+"-")
+	if err != nil && err.Error() == "HTTP 416" {
+		r, _, err = s.open(rel)
+		return r, 0, err
+	}
+	if err != nil || status == 200 {
+		return r, 0, err
+	}
+	var start int64 = -1
+	fmt.Sscanf(hdr.Get("Content-Range"), "bytes %d-", &start)
+	if start != offset {
+		r.Close()
+		r, _, err = s.open(rel)
+		return r, 0, err
+	}
+	return r, offset, nil
+}
+
+// openRange is open with an optional Range header; it also returns the HTTP status (200, or 206 for a range).
+func (s source) openRange(rel, rng string) (io.ReadCloser, http.Header, int, error) {
+	if !s.remote {
+		if err := s.context().Err(); err != nil {
+			return nil, nil, 0, err
+		}
+		f, err := os.Open(filepath.Join(s.base, filepath.FromSlash(rel)))
+		return f, nil, 200, err
 	}
 	wait := retryBase
 	for try := 0; ; try++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		resp, err := s.requestCtx(ctx, "GET", rel, "")
+		ctx, cancel := context.WithCancel(s.context())
+		resp, err := s.requestCtx(ctx, "GET", rel, rng)
 		if err != nil {
 			cancel()
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
-		if resp.StatusCode == 200 {
-			return &idleReader{r: resp.Body, timer: time.AfterFunc(idleTimeout, cancel)}, resp.Header, nil
+		if resp.StatusCode == 200 || (rng != "" && resp.StatusCode == 206) {
+			return &idleReader{r: resp.Body, timer: time.AfterFunc(idleTimeout, cancel)}, resp.Header, resp.StatusCode, nil
 		}
 		resp.Body.Close()
 		cancel()
 		if (resp.StatusCode != 429 && resp.StatusCode != 503) || try == maxRetries {
-			return nil, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+			return nil, nil, 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 		d := wait
 		if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs >= 0 && secs <= 600 {
 			d = time.Duration(secs) * time.Second
 		}
-		time.Sleep(d)
+		select {
+		case <-time.After(d):
+		case <-s.context().Done():
+			return nil, nil, 0, s.context().Err()
+		}
 		wait *= 2
 	}
 }

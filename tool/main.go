@@ -1,15 +1,12 @@
-// kfeed builds, signs, checks and serves karaoke feeds (SPEC.md, karaoke-feed/0.2).
-// Standard library only.
-package main
+// Package kfeed builds, signs, checks and serves karaoke feeds (SPEC.md, karaoke-feed/0.2), and downloads them
+// into a library folder. The kfeed command is in cmd/kfeed. Standard library only.
+package kfeed
 
 import (
 	"flag"
 	"fmt"
 	"os"
 )
-
-// version is set at release time with -ldflags "-X main.version=v1.2.3".
-var version = "dev"
 
 const usageText = `kfeed - build, sign, check and serve karaoke feeds (spec karaoke-feed/0.2)
 
@@ -58,26 +55,33 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 	}
 }
 
-func main() {
-	if len(os.Args) < 2 {
+// version is shown by "kfeed version" and on the generated feed page; Run sets it.
+var version = "dev"
+
+// Run runs the kfeed command line. args are the full arguments including the program name (os.Args); ver is
+// printed by "kfeed version". It returns the exit code.
+func Run(args []string, ver string) int {
+	version = ver
+	if len(args) < 2 {
 		fmt.Fprint(os.Stderr, usageText)
-		os.Exit(2)
+		return 2
 	}
 	cmds := map[string]func([]string) error{
 		"init": cmdInit, "keygen": cmdKeygen, "pubkey": cmdPubkey,
 		"build": cmdBuild, "verify": cmdVerify, "serve": cmdServe, "sync": cmdSync,
 		"version": func([]string) error { fmt.Printf("kfeed %s (format %s)\n", version, Spec); return nil },
 	}
-	cmd, ok := cmds[os.Args[1]]
+	cmd, ok := cmds[args[1]]
 	if !ok {
 		fmt.Fprint(os.Stderr, usageText)
-		if os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
-			return
+		if args[1] == "help" || args[1] == "-h" || args[1] == "--help" {
+			return 0
 		}
-		os.Exit(2)
+		return 2
 	}
-	if err := cmd(os.Args[2:]); err != nil {
+	if err := cmd(args[2:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
