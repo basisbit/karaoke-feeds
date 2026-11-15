@@ -16,7 +16,7 @@ A format and tools for "podcast-style" feeds of karaoke songs in the UltraStar f
 ## Quick start
 
 ```
-cd tool && go build -o kfeed . && cd ..      # needs Go 1.22+, no other dependencies; or download a release binary
+cd tool && go build -o kfeed ./cmd/kfeed && cd ..      # needs Go 1.22+, no other dependencies; or download a release binary
 tool/kfeed init my-feed                       # then edit my-feed/feed-config.json
 #   put songs into my-feed/songs/<Category>/<song folder>/
 tool/kfeed build my-feed                      # creates my-feed/public/ (with a web page for visitors) and reports what changed

@@ -1,4 +1,4 @@
-package main
+package kfeed
 
 import (
 	"bytes"
@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -380,4 +383,51 @@ func TestSyncHostileFeed(t *testing.T) {
 	if exists(filepath.Join(r.lib, "e", "s.txt")) {
 		t.Error("incomplete song made visible")
 	}
+}
+
+// TestResumeWithinSync: a download that breaks off is continued with a Range request on the next attempt; only the
+// missing bytes are transferred again. A server without Range support (TestIncompleteDownloads) starts over.
+func TestResumeWithinSync(t *testing.T) {
+	retryBase = 10 * time.Millisecond
+	dir := t.TempDir()
+	config(dir)
+	song(dir, "Songs", "a", "a.txt", h("X", "a", "a.mp3"), by, "a.mp3")
+	rebuild(t, dir, "")
+	pub := filepath.Join(dir, "public")
+	var cut atomic.Bool
+	var ranges []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/blobs/") {
+			mu.Lock()
+			ranges = append(ranges, r.Header.Get("Range"))
+			mu.Unlock()
+			data, err := os.ReadFile(filepath.Join(pub, filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/"))))
+			if err == nil && len(data) > 1000 && !cut.Swap(true) { // the first download of the big file breaks off
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.WriteHeader(200)
+				w.Write(data[:len(data)/2])
+				return // the body is shorter than announced: the client sees the connection end early
+			}
+		}
+		feedHandler(pub).ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	mp3, _ := os.ReadFile(filepath.Join(dir, "songs", "Songs", "a", "a.mp3"))
+	txt, _ := os.ReadFile(filepath.Join(dir, "songs", "Songs", "a", "a.txt"))
+	r := syncRun{t, t.TempDir()}
+	rep := r.ok(srv.URL+"/feed.json", syncOpts{all: true, jobs: 1}, "added (1)")
+	half := len(mp3) / 2
+	if want := "bytes=" + strconv.Itoa(half) + "-"; !slices.Contains(ranges, want) {
+		t.Fatalf("no Range request %q; requests: %q", want, ranges)
+	}
+	if rep.downloaded != int64(len(mp3)+len(txt)) || rep.retried != 1 {
+		t.Fatalf("downloaded %d bytes with %d retries; want %d (each byte once) and 1", rep.downloaded, rep.retried, len(mp3)+len(txt))
+	}
+	filepath.Walk(r.lib, func(p string, _ os.FileInfo, _ error) error {
+		if strings.Contains(p, partPrefix) {
+			t.Errorf("part file left: %s", p)
+		}
+		return nil
+	})
 }

@@ -1,4 +1,4 @@
-package main
+package kfeed
 
 // The landing page: kfeed build writes index.html, index.css and index.js next to feed.json, so that a person who
 // opens the feed's address in a browser sees what it is and how to use it. Static, self-contained (no fonts,

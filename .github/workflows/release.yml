@@ -45,7 +45,7 @@ jobs:
           for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
             os=${target%/*} arch=${target#*/} ext=""
             [ "$os" = windows ] && ext=.exe
-            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o "../dist/kfeed-$TAG-$os-$arch$ext" .
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o "../dist/kfeed-$TAG-$os-$arch$ext" ./cmd/kfeed
           done
           cd ../dist && sha256sum -- * > SHA256SUMS
       - name: Attach to the release
