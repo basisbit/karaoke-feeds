@@ -588,7 +588,41 @@ func acceptFeed(ctx context.Context, st *syncState, given string, newLocation bo
 	if given != "" {
 		try = append([]string{given}, slices.DeleteFunc(try, func(l string) bool { return l == given })...)
 	}
+	// accept stores what a verified, not older feed tells: only then its location counts (no stale copy, no
+	// unreachable moved_to is remembered).
+	type verified struct {
+		f     Feed
+		raw   []byte
+		loc   string
+		trust []string
+	}
+	// via is where the subscription reached the feed (before a move).
+	accept := func(v verified, via, movedTo string) (*Feed, []byte, bool, error) {
+		if via == given && newLocation && !slices.Contains(st.Locations, via) {
+			st.Locations = append([]string{via}, st.Locations...) // a new place for this feed (LAN, USB)
+		}
+		if movedTo != "" {
+			st.Locations = append([]string{movedTo}, slices.DeleteFunc(st.Locations, func(l string) bool { return l == movedTo })...)
+			rep.feedNote = "the feed moved to " + movedTo
+		}
+		if len(v.trust) > 0 {
+			st.Trust = v.f.Keys
+		}
+		st.Sequence, st.FeedSHA = v.f.Sequence, hashBytes(v.raw)
+		if len(st.Locations) == 0 {
+			st.Locations = []string{v.loc}
+		}
+		if err := writeAtomic(cached, v.raw); err != nil {
+			return nil, nil, false, err
+		}
+		if rep.feedNote == "" {
+			rep.feedNote = fmt.Sprintf("feed %q, sequence %d, %s", v.f.Name, v.f.Sequence, map[bool]string{true: "signed", false: "unsigned"}[len(v.trust) > 0])
+		}
+		return &v.f, v.raw, len(v.trust) > 0, nil
+	}
 	var notes []string
+	// moving: a verified feed that names a new address (moved_to); used if the new address fails.
+	var moving *verified
 	for hop := 0; hop < 2; hop++ { // the second round follows moved_to once
 		for _, loc := range try {
 			src := newSource(loc)
@@ -614,39 +648,29 @@ func acceptFeed(ctx context.Context, st *syncState, given string, newLocation bo
 					continue
 				}
 			}
-			if loc == given && newLocation && !slices.Contains(st.Locations, loc) {
-				st.Locations = append([]string{loc}, st.Locations...) // verified: a new place for this feed (LAN, USB)
-			}
 			if st.Sequence > 0 && (f.Sequence < st.Sequence || (f.Sequence == st.Sequence && hashBytes(raw) != st.FeedSHA)) {
 				notes = append(notes, fmt.Sprintf("%s: older than the feed this library already has; its files are still used", showLoc(loc)))
 				continue
 			}
-			if len(trust) > 0 && f.MovedTo != "" && hop == 0 {
-				if err := checkMirror(f.MovedTo); err == nil {
-					try = []string{strings.TrimSuffix(f.MovedTo, "feed.json")}
-					rep.feedNote = "the feed moved to " + try[0]
-					st.Locations = append(try, slices.DeleteFunc(st.Locations, func(l string) bool { return l == try[0] })...)
-					break
-				}
+			v := verified{f, raw, loc, trust}
+			if hop == 1 {
+				return accept(v, moving.loc, loc) // the new address gave a verified feed
 			}
-			if len(trust) > 0 {
-				st.Trust = f.Keys
+			if len(trust) > 0 && f.MovedTo != "" && checkMirror(f.MovedTo) == nil {
+				moving, try = &v, []string{strings.TrimSuffix(f.MovedTo, "feed.json")}
+				break
 			}
-			st.Sequence, st.FeedSHA = f.Sequence, hashBytes(raw)
-			if len(st.Locations) == 0 {
-				st.Locations = []string{loc}
-			}
-			if err := writeAtomic(cached, raw); err != nil {
-				return nil, nil, false, err
-			}
-			if rep.feedNote == "" {
-				rep.feedNote = fmt.Sprintf("feed %q, sequence %d, %s", f.Name, f.Sequence, map[bool]string{true: "signed", false: "unsigned"}[len(trust) > 0])
-			}
-			return &f, raw, len(trust) > 0, nil
+			return accept(v, loc, "")
 		}
-		if !strings.HasPrefix(rep.feedNote, "the feed moved") {
+		if moving == nil {
 			break
 		}
+	}
+	if moving != nil {
+		notes = append(notes, "the feed names a new address that could not be used")
+		f, raw, signed, err := accept(*moving, moving.loc, "")
+		rep.feedNote = "using the feed from " + showLoc(moving.loc) + " (" + strings.Join(notes, "; ") + ")"
+		return f, raw, signed, err
 	}
 	raw, err := os.ReadFile(cached)
 	if err != nil {

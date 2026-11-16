@@ -3,6 +3,7 @@ package kfeed
 import (
 	"bytes"
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -537,3 +538,61 @@ func TestUnhideFailed(t *testing.T) {
 	}
 }
 
+// TestMovedToUnreachable: a verified feed that names a new address (moved_to) which cannot be reached is still
+// used, and the unverified new address is not stored as a location.
+func TestMovedToUnreachable(t *testing.T) {
+	retryBase = 10 * time.Millisecond
+	dir, keys := t.TempDir(), t.TempDir()
+	k := filepath.Join(keys, "feed.key")
+	p := newKey(t, k)
+	const gone = "http://127.0.0.1:1/"
+	os.WriteFile(filepath.Join(dir, configName), []byte(`{"name":"Moving Feed","operator":{"name":"T","contact":"mailto:t@example.com"},"keys":["`+p+`"],"moved_to":"`+gone+`feed.json"}`), 0o644)
+	song(dir, "Pop", "a", "a.txt", h("A", "One", "a.mp3"), by, "a.mp3")
+	rebuild(t, dir, k)
+	r := syncRun{t, t.TempDir()}
+	rep, out, err := r.do(filepath.Join(dir, "public"), syncOpts{all: true, jobs: 1})
+	if err != nil || rep == nil || len(rep.added) != 1 {
+		t.Fatalf("the verified feed was not used: %v\n%s", err, out)
+	}
+	st, err := loadState(filepath.Join(r.lib, stateDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(st.Locations, gone) {
+		t.Fatalf("the unreachable new address was stored: %v", st.Locations)
+	}
+}
+
+// TestStaleLocationNotStored: a signed feed offered at a new place (a USB stick) that is older than the library's is
+// refused, and that place is not remembered as a location of the feed.
+func TestStaleLocationNotStored(t *testing.T) {
+	retryBase = 10 * time.Millisecond
+	dir, keys := t.TempDir(), t.TempDir()
+	k := filepath.Join(keys, "feed.key")
+	config(dir, newKey(t, k))
+	song(dir, "Pop", "a", "a.txt", h("A", "One", "a.mp3"), by, "a.mp3")
+	rebuild(t, dir, k)
+	pub := filepath.Join(dir, "public")
+	stale := filepath.Join(t.TempDir(), "usb")
+	filepath.WalkDir(pub, func(p string, d fs.DirEntry, err error) error { // the USB copy of this version
+		rel, _ := filepath.Rel(pub, p)
+		if err == nil && !d.IsDir() {
+			data, _ := os.ReadFile(p)
+			os.MkdirAll(filepath.Dir(filepath.Join(stale, rel)), 0o755)
+			os.WriteFile(filepath.Join(stale, rel), data, 0o644)
+		}
+		return nil
+	})
+	song(dir, "Pop", "b", "b.txt", h("B", "Two", "b.mp3"), by, "b.mp3")
+	rebuild(t, dir, k)
+	r := syncRun{t, t.TempDir()}
+	r.ok(pub, syncOpts{all: true, jobs: 1}, "added (2)")
+	r.do(stale, syncOpts{})
+	st, err := loadState(filepath.Join(r.lib, stateDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(st.Locations, stale) {
+		t.Fatalf("the stale copy was stored as a location: %v", st.Locations)
+	}
+}
