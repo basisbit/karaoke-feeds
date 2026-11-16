@@ -504,3 +504,36 @@ func TestSyncIgnoresLocalMirrors(t *testing.T) {
 	}
 }
 
+// TestUnhideFailed: a song that comes back to the feed stays hidden until all its files are there. A failed
+// download must not show it half-done (and a later removal must still find its hidden txt).
+func TestUnhideFailed(t *testing.T) {
+	retryBase = 10 * time.Millisecond
+	dir := t.TempDir()
+	config(dir)
+	a := song(dir, "Pop", "A", "a.txt", h("Ann", "Song", "a.mp3"), by, "a.mp3")
+	song(dir, "Pop", "B", "b.txt", h("Bob", "Other", "b.mp3"), by, "b.mp3") // so the catalog never gets empty
+	rebuild(t, dir, "")
+	pub := filepath.Join(dir, "public")
+	r := syncRun{t, t.TempDir()}
+	r.ok(pub, syncOpts{all: true, jobs: 1}, "added (2)")
+	txt := filepath.Join(r.lib, "ann-song", "a.txt")
+
+	parked := filepath.Join(dir, "parked")
+	os.Rename(a, parked)
+	rebuild(t, dir, "")
+	r.ok("", syncOpts{}, "hidden (no longer in the feed; files kept) (1)")
+
+	os.Rename(parked, a)
+	mp3 := []byte("a new recording, whose download will fail")
+	os.WriteFile(filepath.Join(a, "a.mp3"), mp3, 0o644)
+	rebuild(t, dir, "")
+	sum := hashBytes(mp3)
+	if err := os.Remove(filepath.Join(pub, "blobs", sum[:2], sum)); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := r.do("", syncOpts{})
+	if exists(txt) || !exists(txt+hiddenSuffix) {
+		t.Fatalf("a song whose download failed is shown (visible txt %v):\n%s", exists(txt), out)
+	}
+}
+

@@ -1108,8 +1108,8 @@ func finishSong(o syncOpts, st *syncState, p *songPlan, rep *syncReport) {
 		}
 	}
 	if p.failed || slices.ContainsFunc(p.jobs, func(j *fileJob) bool { return !j.done }) {
-		if p.isNew {
-			hideTxt(p.folder, txt) // nothing of it is visible yet; keep it that way
+		if p.isNew || p.wasHidden {
+			hideTxt(p.folder, txt) // not complete: the game must not list it (planSong showed a hidden one already)
 		}
 		st.Songs[p.id] = &songRec{Catalog: p.catalog, Txt: txt, Hidden: p.isNew || rec.Hidden, Files: files}
 		return
