@@ -478,3 +478,29 @@ func TestKeepLocalOnRemoval(t *testing.T) {
 		t.Error("the chosen pack lost a song")
 	}
 }
+
+// TestSyncIgnoresLocalMirrors: mirrors in a feed must be http(s) URLs. A local folder (or file://, or a Windows UNC
+// path) named by the feed is never read, even when the feed's own address lacks a file.
+func TestSyncIgnoresLocalMirrors(t *testing.T) {
+	pub, local := t.TempDir(), t.TempDir()
+	blob := []byte("x")
+	sum := hashBytes(blob)
+	os.MkdirAll(filepath.Join(local, "blobs", sum[:2]), 0o755) // only the "mirror" has the file
+	os.WriteFile(filepath.Join(local, "blobs", sum[:2], sum), blob, 0o644)
+	lic := &License{SPDX: "CC0-1.0", URL: "https://creativecommons.org/publicdomain/zero/1.0/"}
+	songs := []Song{{ID: "a", Artist: "x", Title: "a", Files: []File{{Role: "txt", Name: "a.txt", SHA256: "sha256:" + sum, Size: 1, License: lic}}}}
+	cat := marshal(Catalog{Spec: Spec, ID: "h", Kind: KindSongs, Songs: songs}, false)
+	cs := hashBytes(cat)
+	os.MkdirAll(filepath.Join(pub, "catalog"), 0o755)
+	os.WriteFile(filepath.Join(pub, "catalog", cs+".json"), cat, 0o644)
+	feed := Feed{Spec: Spec, Name: "m", Operator: Operator{Name: "x", Contact: "mailto:x@example.org"}, Sequence: 1, Generated: "2026-11-14T00:00:00Z",
+		Mirrors:  []string{local, "file://" + filepath.ToSlash(local), `\\server\share`},
+		Catalogs: []CatalogRef{{ID: "h", Kind: KindSongs, Path: "catalog/" + cs + ".json", SHA256: "sha256:" + cs, Size: int64(len(cat))}}}
+	os.WriteFile(filepath.Join(pub, "feed.json"), marshal(feed, true), 0o644)
+	r := syncRun{t, filepath.Join(t.TempDir(), "lib")}
+	rep, out, _ := r.do(pub, syncOpts{all: true, jobs: 1})
+	if rep != nil && len(rep.added) > 0 {
+		t.Fatalf("a song was read from a local mirror:\n%s", out)
+	}
+}
+
