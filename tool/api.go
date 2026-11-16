@@ -292,13 +292,15 @@ func Fetch(ctx context.Context, url, sha256 string, size int64, dest string, pro
 			t.p.BytesDone = fi.Size()
 		}
 		t.send()
-		defer t.every(500 * time.Millisecond)()
 	}
+	stop := t.every(500 * time.Millisecond) // stopped before the last report: one callback at a time
+	defer stop()
 	var err error
 	for try := 1; try <= attempts; try++ {
 		var next bool
 		_, next, err = fetchOnce(s, name, hexsum, size, dest, part, t)
 		if err == nil {
+			stop()
 			t.send()
 			return nil
 		}
@@ -410,7 +412,8 @@ func (t *tracker) every(d time.Duration) (stop func()) {
 			}
 		}
 	}()
-	return func() { close(done); <-finished }
+	var once sync.Once
+	return func() { once.Do(func() { close(done); <-finished }) }
 }
 
 func (t *tracker) finishing() {
