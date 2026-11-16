@@ -2,11 +2,14 @@ package kfeed
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestProgressWithoutRange: the bytes of a part file count as done when a download is continued; when the server
@@ -37,3 +40,31 @@ func TestProgressWithoutRange(t *testing.T) {
 	}
 }
 
+// TestFetchProgressOneAtATime: Fetch calls its progress callback from one goroutine at a time (the launcher updates
+// its window from it). Here the 500 ms tick is still in a slow callback when the download ends.
+func TestFetchProgressOneAtATime(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.Write(data[:500])
+		w.(http.Flusher).Flush()
+		time.Sleep(700 * time.Millisecond) // the tick at 500 ms comes during the download
+		w.Write(data[500:])
+	}))
+	defer srv.Close()
+	var inside, overlap atomic.Int32
+	err := Fetch(context.Background(), srv.URL+"/a.bin", "sha256:"+hashBytes(data), 1000, filepath.Join(t.TempDir(), "a.bin"),
+		func(done, total int64) {
+			if inside.Add(1) > 1 {
+				overlap.Store(1)
+			}
+			time.Sleep(400 * time.Millisecond)
+			inside.Add(-1)
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overlap.Load() != 0 {
+		t.Fatal("the progress callback ran twice at the same time")
+	}
+}
