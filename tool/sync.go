@@ -1028,6 +1028,7 @@ func fetchOnce(s source, rel, hexsum string, size int64, dest, part string, t *t
 		return 0, true, err
 	}
 	if from != have { // the server sent the whole file
+		t.addBytes(-have) // the part's bytes were counted already; they come again
 		have = 0
 		if err := restart(f, h); err != nil {
 			r.Close()
