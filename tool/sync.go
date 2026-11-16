@@ -237,6 +237,9 @@ type syncPass struct {
 	itemOrder  []string // wanted item ids in feed order (catalogs, then items), for "the first item wins"
 }
 
+// errLocked: another process holds the library's lock.
+var errLocked = errors.New("locked")
+
 // openRun locks the library and loads its state. The caller must call unlock when done.
 func openRun(o syncOpts) (r *syncPass, unlock func(), err error) {
 	sdir := filepath.Join(o.lib, stateDirName)
@@ -245,14 +248,14 @@ func openRun(o syncOpts) (r *syncPass, unlock func(), err error) {
 		return nil, nil, err
 	}
 	os.Chmod(sdir, 0o700) // also for libraries made by older versions
-	lock := filepath.Join(sdir, "lock")
-	lf, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, nil, fmt.Errorf("another sync of %s is running (or one crashed: then delete %s)", o.lib, lock)
+	// An OS lock, not a marker file: the system releases it when a sync crashes.
+	unlock, err = lockFile(filepath.Join(sdir, "lock"))
+	if errors.Is(err, errLocked) {
+		return nil, nil, fmt.Errorf("another sync of %s is running", o.lib)
 	}
-	fmt.Fprintf(lf, "%d\n", os.Getpid())
-	lf.Close()
-	unlock = func() { os.Remove(lock) }
+	if err != nil {
+		return nil, nil, err
+	}
 
 	st, err := loadState(sdir)
 	if err != nil {
