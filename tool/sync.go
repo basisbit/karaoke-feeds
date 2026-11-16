@@ -302,7 +302,13 @@ func (r *syncPass) fetchFeed() error {
 		return err
 	}
 	r.feed, r.signed = feed, signed
-	for _, l := range append(slices.Clone(st.Locations), feed.Mirrors...) {
+	locs := slices.Clone(st.Locations)
+	for _, m := range feed.Mirrors {
+		if checkMirror(m) == nil { // never a local path, file:// or UNC path named by the feed
+			locs = append(locs, m)
+		}
+	}
+	for _, l := range locs {
 		src := newSource(l)
 		src.ctx = o.ctx
 		r.locs = append(r.locs, src)
