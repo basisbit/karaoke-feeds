@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/basisbit/karaoke-feeds/compare/v0.2.0...v0.2.1) (2026-11-16)
+
+
+### CI
+
+* show all commit types in release notes ([2200f02](https://github.com/basisbit/karaoke-feeds/commit/2200f023135fef3d3e3d15aee6524383b05edf02))
+
 ## [0.2.0](https://github.com/basisbit/karaoke-feeds/compare/v0.1.1...v0.2.0) (2026-11-15)
 
 
