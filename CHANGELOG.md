@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.2](https://github.com/basisbit/karaoke-feeds/compare/v0.2.1...v0.2.2) (2026-11-17)
+
+
+### Bug fixes
+
+* accept only http(s) mirrors from a feed ([ca9b69c](https://github.com/basisbit/karaoke-feeds/commit/ca9b69c41977c4fe0a9b514aacd504bc40d30a22))
+* count resumed bytes once when the server ignores Range ([f91e447](https://github.com/basisbit/karaoke-feeds/commit/f91e447368f3d166acdc86d008f0ab78bc5a6c00))
+* keep a returning song hidden until its files are complete ([ec1ceb1](https://github.com/basisbit/karaoke-feeds/commit/ec1ceb1f0884b8a9d9888438c90dda989a5a1c2e))
+* release the sync lock after a crash ([5e33d96](https://github.com/basisbit/karaoke-feeds/commit/5e33d96eb31d378e7647bc5d658da2b2bfed428f))
+* report Fetch progress from one goroutine at a time ([41bfe4b](https://github.com/basisbit/karaoke-feeds/commit/41bfe4bea505b576490e7281050b938970c5d770))
+* store feed locations only after all checks ([8faef9c](https://github.com/basisbit/karaoke-feeds/commit/8faef9cda9e343eed54809fe3efbefd11a7b0d6b))
+
 ## [0.2.1](https://github.com/basisbit/karaoke-feeds/compare/v0.2.0...v0.2.1) (2026-11-16)
 
 
